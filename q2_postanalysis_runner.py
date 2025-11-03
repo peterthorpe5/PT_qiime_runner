@@ -50,6 +50,8 @@ from statistics import median_low
 import sys
 from typing import Dict, Iterable, List, Optional, Tuple
 from html import escape
+from datetime import datetime
+import pandas as pd 
 
 
 # ----------------------------- utilities ----------------------------- #
@@ -110,6 +112,170 @@ def run(cmd: List[str], log: logging.Logger, logfile: Optional[Path] = None) -> 
 
 
 
+from typing import Optional, Sequence
+from pathlib import Path
+import subprocess
+import logging
+
+
+def _find_sample_frequency_file(
+    *,
+    export_dir: Path,
+    log: logging.Logger,
+) -> Optional[Path]:
+    """
+    Locate the per-sample frequency table inside an exported QIIME visualisation.
+
+    QIIME often places the table under ``<export_dir>/data/sample-frequency.tsv``.
+    Some templates omit TSVs entirely; in that case this function returns ``None``.
+
+    Parameters
+    ----------
+    export_dir : pathlib.Path
+        Directory produced by ``qiime tools export`` for the feature-table summary.
+    log : logging.Logger
+        Logger used for debug/progress messages.
+
+    Returns
+    -------
+    pathlib.Path or None
+        Path to a plausible frequency table if found, otherwise ``None``.
+    """
+    candidates: Sequence[Path] = (
+        export_dir / "data" / "sample-frequency.tsv",
+        export_dir / "sample-frequency.tsv",
+        export_dir / "data" / "sample-frequencies.tsv",
+        export_dir / "data" / "sample-frequency-detail.tsv",
+        export_dir / "data" / "sample-frequency-detail.csv",
+    )
+    for path in candidates:
+        if path.exists():
+            return path
+
+    data_dir = export_dir / "data"
+    if data_dir.exists():
+        for path in sorted(list(data_dir.glob("*.tsv")) + list(data_dir.glob("*.csv"))):
+            try:
+
+                pd.read_csv(
+                    path,
+                    sep="\t" if path.suffix.lower() == ".tsv" else ",",
+                    nrows=5,
+                    dtype=str,
+                )
+                log.debug("Considering %s as a sample-frequency candidate.", path)
+                return path
+            except Exception:  # nosec B902 - broad on purpose, we just skip candidates
+                continue
+    return None
+
+
+
+def _biom_to_depths_via_tsv(
+    *,
+    biom_path: Path,
+    work_dir: Path,
+) -> "pd.DataFrame":
+    """
+    Convert a BIOM matrix to TSV and compute per-sample read depths.
+
+    Requires the ``biom`` CLI (available in QIIME environments). The TSV is
+    parsed to sum counts across features per sample.
+
+    Parameters
+    ----------
+    biom_path : pathlib.Path
+        Path to ``feature-table.biom``.
+    work_dir : pathlib.Path
+        Working directory to store the temporary TSV output.
+
+    Returns
+    -------
+    pandas.DataFrame
+        Data frame with columns ``sample-id`` (str) and ``depth`` (int).
+
+    Raises
+    ------
+    ValueError
+        If the converted TSV has an unexpected layout.
+    """
+
+    work_dir.mkdir(parents=True, exist_ok=True)
+    tsv_path = work_dir / "feature-table.tsv"
+
+    cmd = [
+        "biom",
+        "convert",
+        "--to-tsv",
+        "--input-fp",
+        str(biom_path),
+        "--output-fp",
+        str(tsv_path),
+    ]
+    subprocess.run(  # nosec B603
+        cmd,
+        check=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+
+    df = pd.read_csv(tsv_path, sep="\t", comment="#", dtype=str)
+    if df.empty or df.shape[1] < 2:
+        raise ValueError(f"Unexpected BIOM TSV layout in {tsv_path}")
+
+    sample_cols = list(df.columns[1:])
+    numeric = df[sample_cols].apply(pd.to_numeric, errors="coerce").fillna(0)
+    depths = numeric.sum(axis=0).astype(int).reset_index()
+    depths.columns = ["sample-id", "depth"]
+    return depths
+
+
+def _load_depths_fallback_from_table(
+    *,
+    table_qza: Path,
+    out_dir: Path,
+    log: logging.Logger,
+) -> Optional["pd.DataFrame"]:
+    """
+    Derive per-sample depths from ``table.qza`` when QZV export lacks TSVs.
+
+    This uses ``qiime tools export`` followed by ``biom convert`` to obtain a
+    TSV matrix, from which per-sample depths are computed.
+
+    Parameters
+    ----------
+    table_qza : pathlib.Path
+        Path to ``table.qza``.
+    out_dir : pathlib.Path
+        Base output directory where export artefacts can be written.
+    log : logging.Logger
+        Logger used for progress messages.
+
+    Returns
+    -------
+    pandas.DataFrame or None
+        Data frame with columns ``sample-id`` and ``depth`` if successful,
+        otherwise ``None`` (a warning is logged).
+    """
+    try:
+        biom_dir = out_dir / "exports" / "table_export"
+        biom_path = _export_table_biom(
+            table_qza=table_qza,
+            export_dir=biom_dir,
+            log=log,
+        )
+        work_dir = biom_dir / "tmp"
+        depths = _biom_to_depths_via_tsv(
+            biom_path=biom_path,
+            work_dir=work_dir,
+        )
+        log.info("Derived per-sample depths from feature table (BIOM → TSV).")
+        return depths
+    except Exception as exc:  # nosec B902 - broad on purpose, we log and return None
+        log.warning("Fallback depth derivation from table.qza failed: %s", exc)
+        return None
+
+
 def _load_depths_from_export(*, sample_freq_tsv: Path) -> pd.DataFrame:
     """Load per-sample read depths from QIIME's sample-frequency.tsv.
 
@@ -127,7 +293,6 @@ def _load_depths_from_export(*, sample_freq_tsv: Path) -> pd.DataFrame:
         FileNotFoundError: If the file does not exist.
         ValueError: If required columns cannot be identified.
     """
-    import pandas as pd  # local import to avoid top-level dependency if unused
 
     if not sample_freq_tsv.exists():
         raise FileNotFoundError(f"Missing {sample_freq_tsv}")
@@ -155,7 +320,6 @@ def _load_metadata_for_depth(*, metadata_tsv: Path) -> pd.DataFrame:
     Returns:
         DataFrame containing at least 'sample-id'.
     """
-    import pandas as pd
 
     md = pd.read_csv(metadata_tsv, sep="\t", dtype=str, comment="#")
     first = md.columns[0]
@@ -174,8 +338,6 @@ def _retention_curve(*, depths: "pd.Series", candidates: "List[int]") -> "pd.Dat
     Returns:
         DataFrame with columns: depth, n_kept, frac_kept.
     """
-    import pandas as pd
-
     n_total = int((depths > 0).sum())
     rows = []
     for d in candidates:
@@ -198,8 +360,6 @@ def _retention_by_group(
     Returns:
         DataFrame with columns: depth, group, n_group, n_kept, frac_kept.
     """
-    import pandas as pd
-
     rows = []
     for g, sub in df.groupby(group_column, dropna=False):
         sub_total = int((sub["depth"] > 0).sum())
@@ -292,11 +452,38 @@ def recommend_rarefaction_depth(
         Integer depth recommendation, or None if not derivable.
     """
     try:
-        import pandas as pd  # local import to keep top-level light
+        # 1) Prefer a QZV-exported frequency file if present
+        freq_file = _find_sample_frequency_file(export_dir=summary_export_dir, log=log)
+        if freq_file:
+            depths = _load_depths_from_export(sample_freq_file=freq_file)
+            log.info("Loaded per-sample depths from %s", freq_file)
+        else:
+            # 2) Fallback: compute depths from feature table directly (BIOM → TSV)
+            log.info("No sample-frequency.tsv in QZV export; deriving depths from table.qza instead.")
+            # table.qza is next to metadata in the input dir; we pass it via caller in main()
+            # We cannot see it here, so we’ll re-derive its path in main() and pass via out closure.
+            # Easiest: infer `table.qza` location from metadata path (both in the same folder).
+            table_qza = metadata_tsv.parent / "table.qza"
+            depths = _load_depths_fallback_from_table(table_qza=table_qza, out_dir=out_dir.parent, log=log)
+            if depths is None:
+                log.warning("Depth recommendation: could not derive depths from table.qza fallback.")
+                return None
 
-        freq_tsv = summary_export_dir / "sample-frequency.tsv"
-        depths = _load_depths_from_export(sample_freq_tsv=freq_tsv)
         meta = _load_metadata_for_depth(metadata_tsv=metadata_tsv)
+
+        depths["sample-id"] = (
+                    depths["sample-id"]
+                    .astype(str)
+                    .str.strip()
+                    )
+
+        meta["sample-id"] = (
+                    meta["sample-id"]
+                    .astype(str)
+                    .str.strip()
+                )
+
+
 
         if not group_column or group_column not in meta.columns:
             log.info(
@@ -306,9 +493,27 @@ def recommend_rarefaction_depth(
             return None
 
         df = depths.merge(meta, on="sample-id", how="inner")
+        n_depth = int(depths["sample-id"].nunique())
+        n_meta = int(meta["sample-id"].nunique())
+        n_overlap = int(df["sample-id"].nunique())
+        log.info(
+            "Depths×Metadata sample IDs: %d in table, %d in metadata, %d overlapping.",
+            n_depth, n_meta, n_overlap,
+        )
+        if n_overlap == 0:
+            # Optional: show a few examples to debug naming/whitespace issues
+            ex_depth = list(depths["sample-id"].astype(str).head(5))
+            ex_meta = list(meta["sample-id"].astype(str).head(5))
+            log.warning(
+                "No overlap between depths and metadata sample IDs. "
+                "Examples (depths): %s | (metadata): %s",
+                ex_depth, ex_meta,
+            )
+
         if df.empty:
             log.warning("Depth recommendation: no overlapping sample IDs between depths and metadata.")
             return None
+
 
         # Candidate grid: unique depths or quantile grid if very large.
         uniq = sorted(set(df["depth"].tolist()))
@@ -635,6 +840,132 @@ def summarize_depths(summary_export_dir: Path) -> Dict[str, int]:
     }
 
 
+def _export_table_biom(*, table_qza: Path, export_dir: Path, log: logging.Logger) -> Path:
+    """Export a QIIME 2 feature table artefact to BIOM format.
+
+    Args:
+        table_qza: Path to table.qza.
+        export_dir: Directory to write the exported BIOM.
+        log: Logger for progress messages.
+
+    Returns:
+        Path to the exported BIOM file (feature-table.biom).
+    """
+    export_dir.mkdir(parents=True, exist_ok=True)
+    biom_path = export_dir / "feature-table.biom"
+    if not biom_path.exists():
+        run(
+            ["qiime", "tools", "export", "--input-path", str(table_qza), "--output-path", str(export_dir)],
+            log,
+        )
+    return biom_path
+
+
+def _biom_to_depths_via_tsv(
+    *,
+    biom_path: Path,
+    work_dir: Path,
+) -> "pd.DataFrame":
+    """
+    Convert a BIOM matrix to TSV and compute per-sample read depths.
+
+    This preserves the BIOM TSV header (which often starts with '#OTU ID')
+    so that sample IDs are parsed correctly.
+
+    Parameters
+    ----------
+    biom_path : pathlib.Path
+        Path to ``feature-table.biom``.
+    work_dir : pathlib.Path
+        Working directory to store the temporary TSV output.
+
+    Returns
+    -------
+    pandas.DataFrame
+        Data frame with columns ``sample-id`` (str) and ``depth`` (int).
+
+    Raises
+    ------
+    ValueError
+        If the converted TSV has an unexpected layout.
+    """
+    work_dir.mkdir(parents=True, exist_ok=True)
+    tsv_path = work_dir / "feature-table.tsv"
+
+    cmd = [
+        "biom",
+        "convert",
+        "--to-tsv",
+        "--input-fp",
+        str(biom_path),
+        "--output-fp",
+        str(tsv_path),
+    ]
+    subprocess.run(  # nosec B603
+        cmd,
+        check=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+
+    # Detect whether the second line is the header ('#OTU ID ...')
+    with tsv_path.open("r", encoding="utf-8") as fh:
+        first = fh.readline()
+        second = fh.readline()
+
+    header_line_index = 0
+    if second.startswith("#OTU ID") or second.startswith("#OTUID"):
+        # Use the second line as header; pandas will strip the leading '#'
+        header_line_index = 1
+
+    df = pd.read_csv(
+        tsv_path,
+        sep="\t",
+        header=header_line_index,
+        dtype=str,
+        engine="python",
+    )
+
+    # Normalise first column name to something like 'Feature ID'
+    first_col = df.columns[0]
+    sample_cols = [c for c in df.columns[1:]]
+    if not sample_cols:
+        raise ValueError(f"Unexpected BIOM TSV layout in {tsv_path}")
+
+    # Convert counts to numeric and sum per sample
+    numeric = df[sample_cols].apply(pd.to_numeric, errors="coerce").fillna(0)
+    depths = numeric.sum(axis=0).astype(int).reset_index()
+    depths.columns = ["sample-id", "depth"]
+    return depths
+
+
+
+def _load_depths_fallback_from_table(
+    *, table_qza: Path, out_dir: Path, log: logging.Logger
+) -> Optional["pd.DataFrame"]:
+    """Fallback path to obtain per-sample depths from table.qza when QZV export lacks TSVs.
+
+    Args:
+        table_qza: Path to table.qza.
+        out_dir: Output directory where temporary/exported files will live.
+        log: Logger for progress messages.
+
+    Returns:
+        DataFrame with columns 'sample-id' and 'depth', or None on failure.
+    """
+    try:
+        biom_dir = out_dir / "exports" / "table_export"
+        biom_path = _export_table_biom(table_qza=table_qza, export_dir=biom_dir, log=log)
+        work_dir = out_dir / "exports" / "table_export" / "tmp"
+        depths = _biom_to_depths_via_tsv(biom_path=biom_path, work_dir=work_dir)
+        log.info("Derived per-sample depths from feature table (BIOM → TSV).")
+        return depths
+    except Exception as e:
+        log.warning("Fallback depth derivation from table.qza failed: %s", e)
+        return None
+
+
+
 def write_readme(
     out_dir: Path,
     sampling_depth: int,
@@ -791,6 +1122,14 @@ def main() -> None:
     )
 
     parser.add_argument(
+        "--min_depth_floor",
+        type=int,
+        default=100,
+        help="Minimum rarefaction depth floor; if the recommended depth is lower, "
+            "this floor will be used instead (default: 100).",
+    )
+
+    parser.add_argument(
         "--min_overall",
         type=float,
         default=0.85,
@@ -919,12 +1258,33 @@ def main() -> None:
         # Final safety default
         log.warning("Could not infer sampling depth; defaulting to 10000.")
         depth = 10000
+    
+    # If a floor is set, clamp small depths up to the floor (with a warning)
+    if depth < args.min_depth_floor:
+        log.warning(
+            "Recommended depth %d is below the floor %d; using the floor instead. "
+            "Consider dropping ultra-low samples or relaxing retention thresholds.",
+            depth, args.min_depth_floor,
+        )
+        depth = args.min_depth_floor
+
 
     log.info("Using sampling depth: %d", depth)
 
 
     # 1) Core metrics (phylogenetic)
-    core_dir = art / "core_metrics"
+
+    core_dir = art / f"core_metrics_d{depth}"
+    if core_dir.exists():
+        ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+        alt = art / f"core_metrics_d{depth}_{ts}"
+        log.warning(
+            "Core metrics output dir %s already exists; using %s instead.",
+            core_dir, alt
+        )
+        core_dir = alt
+
+
     run(
         [
             "qiime",
