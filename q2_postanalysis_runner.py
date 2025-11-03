@@ -797,6 +797,74 @@ def _export_table_biom(*, table_qza: Path, export_dir: Path, log: logging.Logger
         )
     return biom_path
 
+
+def _collapsed_table_stats(*, table_qza: Path, work_dir: Path, log: logging.Logger) -> dict:
+    """
+    Export a collapsed table.qza -> BIOM -> TSV and return basic stats:
+    - n_features (rows)
+    - n_nonzero_features (rows with any nonzero counts)
+    - total_frequency (sum of all counts)
+    """
+    work_dir.mkdir(parents=True, exist_ok=True)
+    # Export to BIOM (reuses your helper)
+    biom_path = _export_table_biom(table_qza=table_qza, export_dir=work_dir, log=log)
+    tsv_path = work_dir / "feature-table.tsv"
+
+    # Convert BIOM -> TSV
+    subprocess.run(
+        ["biom", "convert", "--to-tsv", "--input-fp", str(biom_path), "--output-fp", str(tsv_path)],
+        check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+    )
+
+    # Detect header line (“#OTU ID …” often sits on line 2)
+    with tsv_path.open("r", encoding="utf-8") as fh:
+        _ = fh.readline()
+        maybe_header = fh.readline()
+
+    header_line_index = 1 if (maybe_header.startswith("#OTU ID") or maybe_header.startswith("#OTUID")) else 0
+    df = pd.read_csv(tsv_path, sep="\t", header=header_line_index, dtype=str, engine="python")
+
+    if df.shape[1] < 2:
+        return {"n_features": 0, "n_nonzero_features": 0, "total_frequency": 0}
+
+    # samples are columns 1..N
+    numeric = df.iloc[:, 1:].apply(pd.to_numeric, errors="coerce").fillna(0)
+    row_sums = numeric.sum(axis=1)
+    n_features = int(df.shape[0])
+    n_nonzero = int((row_sums > 0).sum())
+    total_freq = int(numeric.values.sum())
+    return {"n_features": n_features, "n_nonzero_features": n_nonzero, "total_frequency": total_freq}
+
+
+def write_taxa_summary_tsv(*, out_dir: Path, art_dir: Path, tax_levels: List[int], log: logging.Logger) -> None:
+    """
+    For each collapsed level table_L{L}.qza in `art_dir`, compute stats and write
+    out_dir/taxa_summary.tsv with columns: level, n_features, n_nonzero_features, total_frequency.
+    """
+    rows = []
+    for level in sorted(tax_levels):
+        qza = art_dir / f"table_L{level}.qza"
+        if not qza.exists():
+            log.info("No collapsed table for level %s; skipping in taxa_summary.", level)
+            continue
+        stats = _collapsed_table_stats(table_qza=qza, work_dir=art_dir / f"table_L{level}_export", log=log)
+        rows.append({
+            "level": level,
+            "n_features": stats["n_features"],
+            "n_nonzero_features": stats["n_nonzero_features"],
+            "total_frequency": stats["total_frequency"],
+        })
+
+    out_fp = out_dir / "taxa_summary.tsv"
+    with out_fp.open("w", encoding="utf-8", newline="") as fh:
+        w = csv.writer(fh, delimiter="\t")
+        w.writerow(["level", "n_features", "n_nonzero_features", "total_frequency"])
+        for r in rows:
+            w.writerow([r["level"], r["n_features"], r["n_nonzero_features"], r["total_frequency"]])
+    log.info("Wrote %s", out_fp)
+
+
+
 def _group_counts_after_rarefy(
     *,
     rarefied_table: Path,
@@ -1008,6 +1076,8 @@ def _alpha_vectors_for_metric(
     )
     return out_vec
 
+
+
 def _is_phylogenetic_beta(metric: str) -> bool:
     """Return True if a beta metric is phylogenetic (needs a tree).
 
@@ -1015,10 +1085,12 @@ def _is_phylogenetic_beta(metric: str) -> bool:
         metric: Beta-diversity metric name.
 
     Returns:
-        True for phylogenetic metrics such as UniFrac; False otherwise.
+        True for UniFrac variants; False otherwise.
     """
     m = metric.strip().lower()
-    return m in {"unweighted_unifrac", "weighted_unifrac", "generalised_unifrac", "generalized_unifrac"}
+    return m in {"unweighted_unifrac", "weighted_unifrac",
+                 "generalised_unifrac", "generalized_unifrac"}
+
 
 
 def write_readme(
@@ -1384,6 +1456,19 @@ def main() -> None:
                     too_small,
                 )
                 skip_alpha = True
+        keep_groups = [g for g, n in gc.items() if int(n) >= 2]
+        skip_beta_group = False
+        if args.group_column:
+            if not keep_groups:
+                log.warning("All groups are singletons after rarefaction; skipping beta-group-significance.")
+                skip_beta_group = True
+            else:
+                # Build a safe SQL-ish WHERE for QIIME (single quotes, escaped)
+                esc = lambda s: str(s).replace("'", "''")
+                where_groups = ", ".join(f"'{esc(g)}'" for g in keep_groups)
+                where_clause = f"{args.group_column} IN ({where_groups})"
+                log.info("PERMANOVA will be run on groups with ≥2 samples: %s", keep_groups)
+
 
     if not skip_alpha:
         
@@ -1414,68 +1499,114 @@ def main() -> None:
 
 
     # 3) Beta diversity: distances, PCoA + Emperor + PERMANOVA if group column
+
+    # after core-metrics runs:
+    rarefied = core_dir / "rarefied_table.qza"
+
+    core_map = {
+        "braycurtis": (
+            "bray_curtis_distance_matrix.qza",
+            "bray_curtis_pcoa_results.qza",
+            "bray_curtis_emperor.qzv",
+        ),
+        "jaccard": (
+            "jaccard_distance_matrix.qza",
+            "jaccard_pcoa_results.qza",
+            "jaccard_emperor.qzv",
+        ),
+        "unweighted_unifrac": (
+            "unweighted_unifrac_distance_matrix.qza",
+            "unweighted_unifrac_pcoa_results.qza",
+            "unweighted_unifrac_emperor.qzv",
+        ),
+        "weighted_unifrac": (
+            "weighted_unifrac_distance_matrix.qza",
+            "weighted_unifrac_pcoa_results.qza",
+            "weighted_unifrac_emperor.qzv",
+        ),
+    }
+
     for metric in args.beta_metrics:
-        dist = art / f"{metric}_distance.qza"
+        # 1) Try to reuse artefacts made by core-metrics-phylogenetic
+        dist = pcoa = emp = None
+        if metric in core_map:
+            d_name, p_name, e_name = core_map[metric]
+            d_path, p_path, e_path = core_dir / d_name, core_dir / p_name, core_dir / e_name
+            if d_path.exists() and p_path.exists() and e_path.exists():
+                dist, pcoa, emp = d_path, p_path, e_path
 
-        if _is_phylogenetic_beta(metric):
-            # UniFrac and friends
+        # 2) If missing, compute from the *rarefied* table (consistent with alpha)
+        if dist is None:
+            dist = art / f"{metric}_distance.qza"
+            if _is_phylogenetic_beta(metric):
+                run(
+                    [
+                        "qiime", "diversity", "beta-phylogenetic",
+                        "--i-table", str(rarefied),
+                        "--i-phylogeny", str(tree),
+                        "--p-metric", metric,
+                        "--p-n-jobs-or-threads", str(args.threads),
+                        "--o-distance-matrix", str(dist),
+                    ],
+                    log, logs / f"beta_{metric}.log",
+                )
+            else:
+                run(
+                    [
+                        "qiime", "diversity", "beta",
+                        "--i-table", str(rarefied),
+                        "--p-metric", metric,
+                        "--o-distance-matrix", str(dist),
+                    ],
+                    log, logs / f"beta_{metric}.log",
+                )
+
+        if pcoa is None:
+            pcoa = art / f"{metric}_pcoa.qza"
+            run(
+                ["qiime", "diversity", "pcoa",
+                "--i-distance-matrix", str(dist),
+                "--o-pcoa", str(pcoa)],
+                log, logs / f"pcoa_{metric}.log",
+            )
+
+        if emp is None:
+            emp = viz / f"{metric}_emperor.qzv"
             run(
                 [
-                    "qiime", "diversity", "beta-phylogenetic",
-                    "--i-table", str(table),
-                    "--i-phylogeny", str(tree),
-                    "--p-metric", metric,
-                    "--p-n-jobs-or-threads", str(args.threads),
-                    "--o-distance-matrix", str(dist),
+                    "qiime", "emperor", "plot",
+                    "--i-pcoa", str(pcoa),
+                    "--m-metadata-file", str(metadata),
+                    "--o-visualization", str(emp),
                 ],
-                log,
-                logs / f"beta_{metric}.log",
+                log, logs / f"emperor_{metric}.log",
             )
-        else:
-            # Non-phylogenetic (e.g., Bray–Curtis, Jaccard)
+
+        if args.group_column and not skip_beta_group:
+            # Filter the distance matrix to eligible groups
+            dist_filt = art / f"{metric}_distance_filtered.qza"
             run(
                 [
-                    "qiime", "diversity", "beta",
-                    "--i-table", str(table),
-                    "--p-metric", metric,
-                    "--o-distance-matrix", str(dist),
+                    "qiime", "diversity", "filter-distance-matrix",
+                    "--i-distance-matrix", str(dist),
+                    "--m-metadata-file", str(metadata),
+                    "--p-where", where_clause,
+                    "--o-filtered-distance-matrix", str(dist_filt),
                 ],
-                log,
-                logs / f"beta_{metric}.log",
+                log, logs / f"filter_dm_{metric}.log",
             )
 
-        pcoa = art / f"{metric}_pcoa.qza"
-        run(
-            ["qiime", "diversity", "pcoa", "--i-distance-matrix", str(dist), "--o-pcoa", str(pcoa)],
-            log,
-            logs / f"pcoa_{metric}.log",
-        )
-
-        emp = viz / f"{metric}_emperor.qzv"
-        run(
-            [
-                "qiime", "emperor", "plot",
-                "--i-pcoa", str(pcoa),
-                "--m-metadata-file", str(metadata),
-                "--o-visualization", str(emp),
-            ],
-            log,
-            logs / f"emperor_{metric}.log",
-        )
-
-        if args.group_column:
             bg = viz / f"{metric}_PERMANOVA_{args.group_column}.qzv"
             run(
                 [
                     "qiime", "diversity", "beta-group-significance",
-                    "--i-distance-matrix", str(dist),
+                    "--i-distance-matrix", str(dist_filt),
                     "--m-metadata-file", str(metadata),
                     "--m-metadata-column", args.group_column,
                     "--o-visualization", str(bg),
                     "--p-pairwise",
                 ],
-                log,
-                logs / f"beta_group_{metric}.log",
+                log, logs / f"beta_group_{metric}.log",
             )
 
 
@@ -1483,41 +1614,19 @@ def main() -> None:
     if taxonomy_present and taxonomy:
         for level in args.tax_levels:
             collapsed = art / f"table_L{level}.qza"
+            collapsed = art / f"table_L{level}.qza"
             run(
                 [
-                    "qiime",
-                    "taxa",
-                    "collapse",
-                    "--i-table",
-                    str(table),
-                    "--i-taxonomy",
-                    str(taxonomy),
-                    "--p-level",
-                    str(level),
-                    "--o-collapsed-table",
-                    str(collapsed),
+                    "qiime", "taxa", "collapse",
+                    "--i-table", str(table),
+                    "--i-taxonomy", str(taxonomy),
+                    "--p-level", str(level),
+                    "--o-collapsed-table", str(collapsed),
                 ],
-                log,
-                logs / f"taxa_collapse_L{level}.log",
+                log, logs / f"taxa_collapse_L{level}.log",
             )
-            bp = viz / f"taxa_barplot_L{level}.qzv"
-            run(
-                [
-                    "qiime",
-                    "taxa",
-                    "barplot",
-                    "--i-table",
-                    str(collapsed),
-                    "--i-taxonomy",
-                    str(taxonomy),
-                    "--m-metadata-file",
-                    str(metadata),
-                    "--o-visualization",
-                    str(bp),
-                ],
-                log,
-                logs / f"taxa_barplot_L{level}.log",
-            )
+            write_taxa_summary_tsv(out_dir=out, art_dir=art, tax_levels=args.tax_levels, log=log)
+
     else:
         log.info("taxonomy.qza not found; skipping taxonomy barplots.")
 
