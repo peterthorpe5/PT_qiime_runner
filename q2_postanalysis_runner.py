@@ -1008,6 +1008,17 @@ def _alpha_vectors_for_metric(
     )
     return out_vec
 
+def _is_phylogenetic_beta(metric: str) -> bool:
+    """Return True if a beta metric is phylogenetic (needs a tree).
+
+    Args:
+        metric: Beta-diversity metric name.
+
+    Returns:
+        True for phylogenetic metrics such as UniFrac; False otherwise.
+    """
+    m = metric.strip().lower()
+    return m in {"unweighted_unifrac", "weighted_unifrac", "generalised_unifrac", "generalized_unifrac"}
 
 
 def write_readme(
@@ -1405,21 +1416,33 @@ def main() -> None:
     # 3) Beta diversity: distances, PCoA + Emperor + PERMANOVA if group column
     for metric in args.beta_metrics:
         dist = art / f"{metric}_distance.qza"
-        run(
-            [
-                "qiime",
-                "diversity",
-                "beta",
-                "--i-table",
-                str(table),
-                "--p-metric",
-                metric,
-                "--o-distance-matrix",
-                str(dist),
-            ],
-            log,
-            logs / f"beta_{metric}.log",
-        )
+
+        if _is_phylogenetic_beta(metric):
+            # UniFrac and friends
+            run(
+                [
+                    "qiime", "diversity", "beta-phylogenetic",
+                    "--i-table", str(table),
+                    "--i-phylogeny", str(tree),
+                    "--p-metric", metric,
+                    "--p-n-jobs-or-threads", str(args.threads),
+                    "--o-distance-matrix", str(dist),
+                ],
+                log,
+                logs / f"beta_{metric}.log",
+            )
+        else:
+            # Non-phylogenetic (e.g., Bray–Curtis, Jaccard)
+            run(
+                [
+                    "qiime", "diversity", "beta",
+                    "--i-table", str(table),
+                    "--p-metric", metric,
+                    "--o-distance-matrix", str(dist),
+                ],
+                log,
+                logs / f"beta_{metric}.log",
+            )
 
         pcoa = art / f"{metric}_pcoa.qza"
         run(
@@ -1431,15 +1454,10 @@ def main() -> None:
         emp = viz / f"{metric}_emperor.qzv"
         run(
             [
-                "qiime",
-                "emperor",
-                "plot",
-                "--i-pcoa",
-                str(pcoa),
-                "--m-metadata-file",
-                str(metadata),
-                "--o-visualization",
-                str(emp),
+                "qiime", "emperor", "plot",
+                "--i-pcoa", str(pcoa),
+                "--m-metadata-file", str(metadata),
+                "--o-visualization", str(emp),
             ],
             log,
             logs / f"emperor_{metric}.log",
@@ -1449,22 +1467,17 @@ def main() -> None:
             bg = viz / f"{metric}_PERMANOVA_{args.group_column}.qzv"
             run(
                 [
-                    "qiime",
-                    "diversity",
-                    "beta-group-significance",
-                    "--i-distance-matrix",
-                    str(dist),
-                    "--m-metadata-file",
-                    str(metadata),
-                    "--m-metadata-column",
-                    args.group_column,
-                    "--o-visualization",
-                    str(bg),
+                    "qiime", "diversity", "beta-group-significance",
+                    "--i-distance-matrix", str(dist),
+                    "--m-metadata-file", str(metadata),
+                    "--m-metadata-column", args.group_column,
+                    "--o-visualization", str(bg),
                     "--p-pairwise",
                 ],
                 log,
                 logs / f"beta_group_{metric}.log",
             )
+
 
     # 4) Taxonomy barplots at specified levels (if taxonomy available)
     if taxonomy_present and taxonomy:
