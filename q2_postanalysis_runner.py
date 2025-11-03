@@ -965,6 +965,75 @@ def _load_depths_fallback_from_table(
         return None
 
 
+def _alpha_vectors_for_metric(
+    *,
+    metric: str,
+    core_dir: Path,
+    art_dir: Path,
+    rarefied_table: Path,
+    table_raw: Path,
+    log: logging.Logger,
+    logs_dir: Path,
+) -> Path:
+    """
+    Resolve (or compute) the alpha-diversity vector for a given metric.
+
+    For metrics produced by core-metrics-phylogenetic we prefer the rarefied
+    outputs. Only if a metric is not present do we compute it; in that case,
+    we compute from the rarefied table to keep inputs consistent.
+
+    Parameters
+    ----------
+    metric : str
+        Alpha-diversity metric name (e.g., 'observed_features', 'shannon',
+        'faith_pd', 'pielou_e').
+    core_dir : pathlib.Path
+        Directory where core-metrics outputs for this depth were written.
+    art_dir : pathlib.Path
+        Directory for ad-hoc artefacts.
+    rarefied_table : pathlib.Path
+        Rarefied table produced by core-metrics.
+    table_raw : pathlib.Path
+        Original (unrarefied) table (kept for reference).
+    log : logging.Logger
+        Logger for progress messages.
+    logs_dir : pathlib.Path
+        Directory for per-step logs.
+
+    Returns
+    -------
+    pathlib.Path
+        Path to the alpha-diversity vector .qza for this metric.
+    """
+    # Mapping from requested metric to core-metrics vector file name
+    metric_to_core = {
+        "observed_features": "observed_features_vector.qza",
+        "shannon": "shannon_vector.qza",
+        "faith_pd": "faith_pd_vector.qza",
+        "pielou_e": "evenness_vector.qza",  # Pielou == evenness from core-metrics
+    }
+
+    core_name = metric_to_core.get(metric)
+    if core_name:
+        core_vec = core_dir / core_name
+        if core_vec.exists():
+            return core_vec
+
+    # Fallback: compute the metric from the rarefied table for consistency
+    out_vec = art_dir / f"{metric}_vector.qza"
+    run(
+        [
+            "qiime", "diversity", "alpha",
+            "--i-table", str(rarefied_table),
+            "--p-metric", metric,
+            "--o-alpha-diversity", str(out_vec),
+        ],
+        log,
+        logs_dir / f"alpha_{metric}.log",
+    )
+    return out_vec
+
+
 
 def write_readme(
     out_dir: Path,
@@ -1109,11 +1178,15 @@ def main() -> None:
         default=[2, 3, 4, 5, 6],
         help="Taxonomy levels for collapsed barplots.",
     )
+
     parser.add_argument(
-        "--run_ancom",
-        action="store_true",
-        help="Run ANCOM using --group_column.",
+        "--no_ancom",
+        dest="run_ancom",
+        action="store_false",
+        help="Skip ANCOM analysis (it now runs by default).",
     )
+    parser.set_defaults(run_ancom=True)
+
     parser.add_argument(
         "--threads",
         type=int,
@@ -1124,7 +1197,7 @@ def main() -> None:
     parser.add_argument(
         "--min_depth_floor",
         type=int,
-        default=100,
+        default=5,
         help="Minimum rarefaction depth floor; if the recommended depth is lower, "
             "this floor will be used instead (default: 100).",
     )
@@ -1307,43 +1380,31 @@ def main() -> None:
         logs / "core_metrics_phylogenetic.log",
     )
 
-    # 2) Alpha diversity (vectors) + group significance
+    # 2) Alpha diversity vectors + group significance (consistent with rarefaction)
+    rarefied = core_dir / "rarefied_table.qza"
     for metric in args.alpha_metrics:
-        vec = core_dir / f"{metric}_vector.qza"
-        if not vec.exists():
-            vec = art / f"{metric}_vector.qza"
-            run(
-                [
-                    "qiime",
-                    "diversity",
-                    "alpha",
-                    "--i-table",
-                    str(table),
-                    "--p-metric",
-                    metric,
-                    "--o-alpha-diversity",
-                    str(vec),
-                ],
-                log,
-                logs / f"alpha_{metric}.log",
-            )
+        vec = _alpha_vectors_for_metric(
+            metric=metric,
+            core_dir=core_dir,
+            art_dir=art,
+            rarefied_table=rarefied,
+            table_raw=table,  # not used now, but kept for clarity
+            log=log,
+            logs_dir=logs,
+        )
         if args.group_column:
             viz_alpha = viz / f"alpha_{metric}_by_{args.group_column}.qzv"
             run(
                 [
-                    "qiime",
-                    "diversity",
-                    "alpha-group-significance",
-                    "--i-alpha-diversity",
-                    str(vec),
-                    "--m-metadata-file",
-                    str(metadata),
-                    "--o-visualization",
-                    str(viz_alpha),
+                    "qiime", "diversity", "alpha-group-significance",
+                    "--i-alpha-diversity", str(vec),
+                    "--m-metadata-file", str(metadata),
+                    "--o-visualization", str(viz_alpha),
                 ],
                 log,
                 logs / f"alpha_group_{metric}.log",
             )
+
 
     # 3) Beta diversity: distances, PCoA + Emperor + PERMANOVA if group column
     for metric in args.beta_metrics:
