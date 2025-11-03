@@ -1,0 +1,38 @@
+# config.yaml — example configuration for q2_amplicon_runner.py
+# Note: q2_amplicon_runner.py does not auto-read this file; pass equivalent
+# named CLI arguments when you run it. Keep this YAML as a recorded recipe.
+
+run_label: "V3V4_Study1"
+
+paths:
+  manifest: "manifests/paired_manifest.tsv"          # PairedEndFastqManifestPhred33V2
+  metadata_tsv: "metadata/metadata16S.tsv"           # QIIME 2 metadata (TSV)
+  out_dir: "results/V3V4_Study1"                     # Output folder root
+  classifier_qza: "taxonomy/silva-138.1-99-515-806-nb-classifier.qza"  # if using sklearn
+
+denoising:
+  denoiser: "dada2_paired"        # "dada2_paired" or "deblur_single"
+  threads: 24
+
+primers:
+  cutadapt_front_f: "CCTACGGGNGGCWGCAG"  # forward primer (example V3–V4)
+  cutadapt_front_r: "GACTACHVGGGTATCTAATCC"  # reverse primer
+  discard_untrimmed: true
+
+dada2_params:
+  trim_left_f: 0
+  trim_left_r: 0
+  trunc_len_f: 240
+  trunc_len_r: 200
+  max_ee_f: 2.0
+  max_ee_r: 2.0
+
+deblur_params:
+  pair_strategy: "join_in_qiime"  # "join_in_qiime" or "forward_only"
+  trim_length: 250                # fixed length after trimming/joining
+
+taxonomy:
+  mode: "sklearn"                 # sklearn classifier route
+
+export:
+  phyloseq_output: true           # produce phyloseq_output/ with artefacts + metadata

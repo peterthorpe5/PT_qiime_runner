@@ -1,0 +1,1170 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+q2_postanalysis_runner
+======================
+
+Standard post-analysis bundle for QIIME 2 outputs.
+
+Given a directory containing:
+  - table.qza
+  - rep-seqs.qza
+  - rooted-tree.qza
+  - metadata.tsv
+  - taxonomy.qza (optional)
+
+This script will:
+
+1) Pick or compute a rarefaction depth (or use --sampling_depth).
+2) Run alpha/beta diversity, PCoA + Emperor plots.
+3) Run alpha/beta group significance tests (if --group_column given).
+4) Make taxonomic barplots at multiple levels (if taxonomy is present).
+5) Optionally run ANCOM on a chosen metadata column.
+6) (Optional) Export all .qzv visualizations to HTML and try PDF rendering.
+7) Write a compact README.md and a summary.tsv with high-level QC stats.
+
+Requires a QIIME 2 environment on PATH.
+
+Example
+-------
+python q2_postanalysis_runner.py \
+  --input_dir results/JH102/phyloseq_output \
+  --out_dir results/JH102/post_analysis \
+  --group_column Treatment \
+  --sampling_depth 12000 \
+  --run_ancom \
+  --export_visuals \
+  --threads 24
+"""
+
+from __future__ import annotations
+
+import argparse
+import csv
+import logging
+import os
+import shutil
+import subprocess
+from pathlib import Path
+from statistics import median_low
+import sys
+from typing import Dict, Iterable, List, Optional, Tuple
+from html import escape
+
+
+# ----------------------------- utilities ----------------------------- #
+
+
+def setup_logging(out_dir: Path) -> logging.Logger:
+    """Configure structured logging to stderr and to a log file.
+
+    Args:
+        out_dir: Output directory where `postanalysis.log` will be written.
+
+    Returns:
+        A configured logger instance (`q2_postanalysis`).
+    """
+    out_dir.mkdir(parents=True, exist_ok=True)
+    log_file = out_dir / "postanalysis.log"
+
+    logger = logging.getLogger("q2_postanalysis")
+    logger.handlers.clear()
+    logger.setLevel(logging.DEBUG)
+
+    stream = logging.StreamHandler(stream=sys.stderr)
+    stream.setLevel(logging.INFO)
+    stream.setFormatter(logging.Formatter("%(levelname)s: %(message)s"))
+
+    fileh = logging.FileHandler(str(log_file), mode="w", encoding="utf-8")
+    fileh.setLevel(logging.DEBUG)
+    fileh.setFormatter(
+        logging.Formatter("%(asctime)s | %(levelname)s | %(message)s")
+    )
+
+    logger.addHandler(stream)
+    logger.addHandler(fileh)
+    logger.info("Logging to %s", log_file)
+    return logger
+
+
+def run(cmd: List[str], log: logging.Logger, logfile: Optional[Path] = None) -> None:
+    """Run a subprocess command and optionally tee to a step log.
+
+    Args:
+        cmd: Command tokens to execute (no shell=True).
+        log: Logger used to emit the starting message.
+        logfile: If provided, stdout/stderr are appended to this file.
+
+    Raises:
+        subprocess.CalledProcessError: If the command exits non-zero.
+    """
+    log.info("▶ %s", " ".join(cmd))
+    if logfile:
+        logfile.parent.mkdir(parents=True, exist_ok=True)
+        with logfile.open("a", encoding="utf-8") as lf:
+            lf.write("$ " + " ".join(cmd) + "\n")
+            lf.flush()
+            subprocess.run(cmd, stdout=lf, stderr=lf, check=True)
+    else:
+        subprocess.run(cmd, check=True)
+
+
+
+def _load_depths_from_export(*, sample_freq_tsv: Path) -> pd.DataFrame:
+    """Load per-sample read depths from QIIME's sample-frequency.tsv.
+
+    The export produced by `qiime feature-table summarize` typically includes a
+    TSV with two columns: Sample ID and Frequency. Column names can vary
+    slightly across QIIME versions, so this function matches them defensively.
+
+    Args:
+        sample_freq_tsv: Path to the exported `sample-frequency.tsv`.
+
+    Returns:
+        DataFrame with columns: 'sample-id' (str) and 'depth' (int).
+
+    Raises:
+        FileNotFoundError: If the file does not exist.
+        ValueError: If required columns cannot be identified.
+    """
+    import pandas as pd  # local import to avoid top-level dependency if unused
+
+    if not sample_freq_tsv.exists():
+        raise FileNotFoundError(f"Missing {sample_freq_tsv}")
+
+    df = pd.read_csv(sample_freq_tsv, sep="\t", dtype=str)
+    canon = {c.strip().lower(): c for c in df.columns}
+
+    sid_col = next((canon[k] for k in canon if "sample" in k and "id" in k), None)
+    freq_col = next((canon[k] for k in canon if "frequency" in k), None)
+    if sid_col is None or freq_col is None:
+        raise ValueError("Could not find 'Sample ID' and 'Frequency' columns in sample-frequency.tsv")
+
+    out = df[[sid_col, freq_col]].copy()
+    out.columns = ["sample-id", "depth"]
+    out["depth"] = pd.to_numeric(out["depth"], errors="coerce").fillna(0).astype(int)
+    return out
+
+
+def _load_metadata_for_depth(*, metadata_tsv: Path) -> pd.DataFrame:
+    """Load metadata TSV and ensure the first column is 'sample-id'.
+
+    Args:
+        metadata_tsv: Path to the analysis metadata TSV.
+
+    Returns:
+        DataFrame containing at least 'sample-id'.
+    """
+    import pandas as pd
+
+    md = pd.read_csv(metadata_tsv, sep="\t", dtype=str, comment="#")
+    first = md.columns[0]
+    if first.lower().replace("_", "-") != "sample-id":
+        md = md.rename(columns={first: "sample-id"})
+    return md
+
+
+def _retention_curve(*, depths: "pd.Series", candidates: "List[int]") -> "pd.DataFrame":
+    """Compute overall retention at each candidate depth.
+
+    Args:
+        depths: Per-sample read depths (ints).
+        candidates: Candidate rarefaction depths.
+
+    Returns:
+        DataFrame with columns: depth, n_kept, frac_kept.
+    """
+    import pandas as pd
+
+    n_total = int((depths > 0).sum())
+    rows = []
+    for d in candidates:
+        kept = int((depths >= d).sum())
+        frac = (kept / n_total) if n_total else 0.0
+        rows.append({"depth": int(d), "n_kept": kept, "frac_kept": frac})
+    return pd.DataFrame(rows)
+
+
+def _retention_by_group(
+    *, df: "pd.DataFrame", group_column: str, candidates: "List[int]"
+) -> "pd.DataFrame":
+    """Compute per-group retention at each candidate depth.
+
+    Args:
+        df: DataFrame with columns: sample-id, depth, and the group column.
+        group_column: Metadata column to balance (e.g., 'Genotype').
+        candidates: Candidate depths.
+
+    Returns:
+        DataFrame with columns: depth, group, n_group, n_kept, frac_kept.
+    """
+    import pandas as pd
+
+    rows = []
+    for g, sub in df.groupby(group_column, dropna=False):
+        sub_total = int((sub["depth"] > 0).sum())
+        for d in candidates:
+            kept = int((sub["depth"] >= d).sum())
+            frac = (kept / sub_total) if sub_total else 0.0
+            rows.append(
+                {
+                    "depth": int(d),
+                    "group": str(g),
+                    "n_group": sub_total,
+                    "n_kept": kept,
+                    "frac_kept": frac,
+                }
+            )
+    return pd.DataFrame(rows)
+
+
+def _choose_depth_balanced(
+    *,
+    overall: "pd.DataFrame",
+    by_group: "pd.DataFrame",
+    min_overall: float,
+    min_each_group: float,
+) -> int:
+    """Select the highest depth meeting overall AND per-group retention thresholds.
+
+    Falls back to highest depth meeting overall only; if none, returns the
+    minimum candidate depth.
+
+    Args:
+        overall: Overall retention table (depth, frac_kept).
+        by_group: Per-group retention table (depth, group, frac_kept).
+        min_overall: Minimum overall retention fraction (e.g., 0.85).
+        min_each_group: Minimum per-group retention fraction (e.g., 0.75).
+
+    Returns:
+        Recommended integer depth.
+    """
+    valid = []
+    for d, sub_o in overall.groupby("depth"):
+        ok_overall = float(sub_o["frac_kept"].iloc[0]) >= min_overall
+        sub_g = by_group[by_group["depth"] == d]
+        ok_groups = sub_g["frac_kept"].min() >= min_each_group if not sub_g.empty else False
+        if ok_overall and ok_groups:
+            valid.append(int(d))
+
+    if valid:
+        return max(valid)
+
+    # Fallback: overall only
+    candidates = overall[overall["frac_kept"] >= min_overall]["depth"].astype(int).tolist()
+    if candidates:
+        return max(candidates)
+
+    # Final fallback: smallest candidate
+    return int(overall["depth"].min())
+
+
+def recommend_rarefaction_depth(
+    *,
+    summary_export_dir: Path,
+    metadata_tsv: Path,
+    group_column: Optional[str],
+    out_dir: Path,
+    min_overall: float,
+    min_each_group: float,
+    log: logging.Logger,
+) -> Optional[int]:
+    """Recommend a rarefaction depth balancing overall and per-group retention.
+
+    This function reads the exported `sample-frequency.tsv`, merges with the
+    metadata, evaluates retention across a sensible candidate grid, writes
+    supporting TSVs, and returns the recommended depth.
+
+    If any step is unavailable (e.g., missing files or no group column), it
+    returns None and the caller may fall back to a simpler heuristic.
+
+    Args:
+        summary_export_dir: Directory created from exporting feature-table summary.
+        metadata_tsv: Path to run metadata TSV (first column is sample-id).
+        group_column: Column name to balance. If None or not present, returns None.
+        out_dir: Folder to write `sample_depths_with_groups.tsv`, `retention_overall.tsv`,
+            `retention_by_group.tsv`, and `recommendation.tsv`.
+        min_overall: Minimum overall retention fraction required.
+        min_each_group: Minimum per-group retention fraction required.
+        log: Logger for progress messages.
+
+    Returns:
+        Integer depth recommendation, or None if not derivable.
+    """
+    try:
+        import pandas as pd  # local import to keep top-level light
+
+        freq_tsv = summary_export_dir / "sample-frequency.tsv"
+        depths = _load_depths_from_export(sample_freq_tsv=freq_tsv)
+        meta = _load_metadata_for_depth(metadata_tsv=metadata_tsv)
+
+        if not group_column or group_column not in meta.columns:
+            log.info(
+                "Depth recommendation: group column not provided/found; "
+                "falling back to percentile-based inference."
+            )
+            return None
+
+        df = depths.merge(meta, on="sample-id", how="inner")
+        if df.empty:
+            log.warning("Depth recommendation: no overlapping sample IDs between depths and metadata.")
+            return None
+
+        # Candidate grid: unique depths or quantile grid if very large.
+        uniq = sorted(set(df["depth"].tolist()))
+        if len(uniq) > 200:
+            qs = list(range(5, 100, 5))
+            qs_vals = [int(pd.Series(df["depth"]).quantile(q / 100.0)) for q in qs]
+            candidates = sorted(set([x for x in qs_vals if x > 0] + [min(uniq), max(uniq)]))
+        else:
+            candidates = [int(x) for x in uniq if x > 0]
+
+        overall = _retention_curve(depths=df["depth"], candidates=candidates)
+        by_group = _retention_by_group(df=df, group_column=group_column, candidates=candidates)
+
+        out_dir.mkdir(parents=True, exist_ok=True)
+        df.to_csv(out_dir / "sample_depths_with_groups.tsv", sep="\t", index=False)
+        overall.to_csv(out_dir / "retention_overall.tsv", sep="\t", index=False)
+        by_group.to_csv(out_dir / "retention_by_group.tsv", sep="\t", index=False)
+
+        rec = _choose_depth_balanced(
+            overall=overall,
+            by_group=by_group,
+            min_overall=min_overall,
+            min_each_group=min_each_group,
+        )
+        pd.DataFrame(
+            [
+                {
+                    "recommended_depth": rec,
+                    "min_overall": min_overall,
+                    "min_each_group": min_each_group,
+                }
+            ]
+        ).to_csv(out_dir / "recommendation.tsv", sep="\t", index=False)
+
+        log.info(
+            "Depth recommendation: %d (overall ≥ %.2f, each %s ≥ %.2f).",
+            rec,
+            min_overall,
+            group_column,
+            min_each_group,
+        )
+        return int(rec)
+
+    except Exception as e:
+        log.warning("Depth recommendation failed (%s); falling back to percentile heuristic.", e)
+        return None
+
+
+
+def write_html_index(out_dir: Path) -> None:
+    """Create a minimal landing page linking to QZVs and exported HTML/PDF.
+
+    The page lists:
+      - All QZV visualizations in ``visuals/`` with direct links.
+      - All exported QZV folders in ``exports/`` (if present), linking to their
+        ``index.html`` and an accompanying PDF when available.
+
+    Args:
+        out_dir: Root post-analysis directory (contains ``visuals/`` and optionally
+            ``exports/``).
+    """
+    visuals = out_dir / "visuals"
+    exports = out_dir / "exports"
+    items_qzv = sorted(visuals.glob("*.qzv")) if visuals.exists() else []
+    export_dirs = sorted([p for p in exports.glob("*") if p.is_dir()]) if exports.exists() else []
+
+    def rel(p: Path) -> str:
+        return escape(str(p.relative_to(out_dir)).replace("\\", "/"))
+
+    # Simple, readable HTML with tiny bit of CSS for clarity.
+    lines = [
+        "<!doctype html>",
+        "<html lang='en'>",
+        "<head>",
+        "  <meta charset='utf-8' />",
+        f"  <title>QIIME 2 Post-analysis — {escape(out_dir.name)}</title>",
+        "  <meta name='viewport' content='width=device-width,initial-scale=1' />",
+        "  <style>",
+        "    body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,Cantarell,'Helvetica Neue',Arial,sans-serif;line-height:1.45;margin:2rem;}",
+        "    h1{font-size:1.6rem;margin:0 0 0.5rem}",
+        "    h2{font-size:1.2rem;margin:2rem 0 0.5rem}",
+        "    .note{color:#555;margin:0.25rem 0 1rem}",
+        "    ul{padding-left:1.2rem}",
+        "    li{margin:0.25rem 0}",
+        "    code{background:#f6f8fa;padding:0.1rem 0.3rem;border-radius:4px}",
+        "    .muted{color:#888}",
+        "  </style>",
+        "</head>",
+        "<body>",
+        f"  <h1>QIIME 2 post-analysis: <code>{escape(out_dir.name)}</code></h1>",
+        "  <p class='note'>This index links to the primary visualisations and their exported HTML/PDF (when available).</p>",
+    ]
+
+    # QZV visualisations
+    lines.append("  <h2>Visualizations (.qzv)</h2>")
+    if items_qzv:
+        lines.append("  <ul>")
+        for q in items_qzv:
+            lines.append(f"    <li><a href='{rel(q)}'>{escape(q.name)}</a></li>")
+        lines.append("  </ul>")
+    else:
+        lines.append("  <p class='muted'>No .qzv files found in <code>visuals/</code>.</p>")
+
+    # Exports with HTML/PDF
+    lines.append("  <h2>Exports (HTML / PDF)</h2>")
+    if export_dirs:
+        lines.append("  <ul>")
+        for d in export_dirs:
+            idx = d / "index.html"
+            pdf = d.with_suffix(".pdf")
+            parts = [escape(d.name)]
+            if idx.exists():
+                parts.append(f"<a href='{rel(idx)}'>HTML</a>")
+            else:
+                parts.append("<span class='muted'>HTML n/a</span>")
+            if pdf.exists():
+                parts.append(f"<a href='{rel(pdf)}'>PDF</a>")
+            else:
+                parts.append("<span class='muted'>PDF n/a</span>")
+            lines.append(f"    <li>{' — '.join(parts)}</li>")
+        lines.append("  </ul>")
+    else:
+        lines.append("  <p class='muted'>No exports found in <code>exports/</code>.</p>")
+
+    lines += [
+        "  <hr />",
+        "  <p class='muted'>Generated automatically by q2_postanalysis_runner.py</p>",
+        "</body>",
+        "</html>",
+    ]
+
+    (out_dir / "index.html").write_text("\n".join(lines), encoding="utf-8")
+
+
+
+def ensure_files(base: Path, names: Iterable[str]) -> None:
+    """Ensure a set of files exists in a directory.
+
+    Args:
+        base: Parent directory to check.
+        names: Filenames expected to exist under `base`.
+
+    Raises:
+        FileNotFoundError: If any of the required files are missing.
+    """
+    missing = [n for n in names if not (base / n).exists()]
+    if missing:
+        raise FileNotFoundError(f"Missing required files: {', '.join(missing)}")
+
+
+def export_qzv(qzv: Path, outdir: Path, log: logging.Logger) -> Path:
+    """Export a QIIME 2 visualization (.qzv) to an HTML folder.
+
+    Args:
+        qzv: Path to the .qzv file.
+        outdir: Directory to create and place exported assets in.
+        log: Logger for progress messages.
+
+    Returns:
+        The path to the created export directory.
+    """
+    outdir.mkdir(parents=True, exist_ok=True)
+    run(
+        ["qiime", "tools", "export", "--input-path", str(qzv), "--output-path", str(outdir)],
+        log,
+    )
+    return outdir
+
+
+def try_html_to_pdf(export_dir: Path, log: logging.Logger, engine: str = "auto") -> None:
+    """Render an exported QZV (index.html) to PDF with the requested engine.
+
+    Args:
+        export_dir: Directory produced by `qiime tools export` (has index.html).
+        log: Logger for progress messages.
+        engine: One of {'auto','chrome','wkhtmltopdf','none'}.
+    """
+    index_html = export_dir / "index.html"
+    if not index_html.exists():
+        log.debug("No index.html in %s; skipping PDF render.", export_dir)
+        return
+
+    pdf_path = export_dir.with_suffix(".pdf")
+
+    def try_chrome() -> bool:
+        for browser in ("chromium", "chromium-browser", "google-chrome", "google-chrome-stable", "chrome"):
+            exe = shutil.which(browser)
+            if not exe:
+                continue
+            log.info("Rendering PDF with Chrome/Chromium: %s", browser)
+            cmd = [
+                exe,
+                "--headless",
+                "--disable-gpu",
+                f"--print-to-pdf={pdf_path}",
+                str(index_html),
+            ]
+            try:
+                subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                if pdf_path.exists():
+                    log.info("PDF written: %s", pdf_path)
+                    return True
+            except subprocess.CalledProcessError as e:
+                log.debug("Chrome render failed (%s): %s", browser, e)
+                continue
+        return False
+
+    def try_wkhtmltopdf() -> bool:
+        exe = shutil.which("wkhtmltopdf")
+        if not exe:
+            return False
+        log.info("Rendering PDF with wkhtmltopdf")
+        # Note: wkhtmltopdf has limited JS support; Vega/Emperor may be incomplete.
+        cmd = [
+            exe,
+            "--quiet",
+            "--enable-local-file-access",
+            "--print-media-type",
+            "--page-size", "A4",
+            str(index_html),
+            str(pdf_path),
+        ]
+        try:
+            subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            if pdf_path.exists():
+                log.info("PDF written: %s", pdf_path)
+                return True
+        except subprocess.CalledProcessError as e:
+            log.debug("wkhtmltopdf render failed: %s", e)
+        return False
+
+    if engine == "none":
+        log.info("PDF rendering disabled (--pdf_engine none).")
+        return
+    elif engine == "chrome":
+        ok = try_chrome()
+        if not ok:
+            log.info("Chrome/Chromium not available or failed; skipping PDF for %s", export_dir)
+        return
+    elif engine == "wkhtmltopdf":
+        ok = try_wkhtmltopdf()
+        if not ok:
+            log.info("wkhtmltopdf not available or failed; skipping PDF for %s", export_dir)
+        return
+    else:  # auto
+        if try_chrome():
+            return
+        if try_wkhtmltopdf():
+            return
+        log.info("No PDF engine available; skipping PDF for %s", export_dir)
+
+
+def infer_sampling_depth_from_summary(summary_export_dir: Path) -> Optional[int]:
+    """Infer a conservative rarefaction depth from a feature-table summary export.
+
+    The function parses `sample-frequency.tsv` and returns the ~15th percentile
+    read depth (rounded down), which is a reasonable default for many cohorts.
+
+    Args:
+        summary_export_dir: Directory created by exporting `feature-table summarize`.
+
+    Returns:
+        An integer rarefaction depth if derivable, otherwise `None`.
+    """
+    freq_tsv = summary_export_dir / "sample-frequency.tsv"
+    if not freq_tsv.exists():
+        return None
+
+    depths: List[int] = []
+    with freq_tsv.open("r", encoding="utf-8") as fh:
+        reader = csv.reader(fh, delimiter="\t")
+        _ = next(reader, None)  # header
+        for row in reader:
+            if not row or row[0].startswith("#"):
+                continue
+            try:
+                depths.append(int(row[1]))
+            except Exception:
+                continue
+
+    if not depths:
+        return None
+
+    depths.sort()
+    idx = max(0, int(len(depths) * 0.15) - 1)
+    return depths[idx]
+
+
+def summarize_depths(summary_export_dir: Path) -> Dict[str, int]:
+    """Summarize basic depth statistics from `sample-frequency.tsv`.
+
+    Args:
+        summary_export_dir: Directory created by exporting `feature-table summarize`.
+
+    Returns:
+        A dictionary with keys: n_samples, min_depth, median_depth, max_depth.
+        If unavailable, returns zeros for all fields.
+    """
+    freq_tsv = summary_export_dir / "sample-frequency.tsv"
+    if not freq_tsv.exists():
+        return {"n_samples": 0, "min_depth": 0, "median_depth": 0, "max_depth": 0}
+
+    depths: List[int] = []
+    with freq_tsv.open("r", encoding="utf-8") as fh:
+        reader = csv.reader(fh, delimiter="\t")
+        _ = next(reader, None)
+        for row in reader:
+            if not row or row[0].startswith("#"):
+                continue
+            try:
+                depths.append(int(row[1]))
+            except Exception:
+                continue
+
+    if not depths:
+        return {"n_samples": 0, "min_depth": 0, "median_depth": 0, "max_depth": 0}
+
+    depths.sort()
+    return {
+        "n_samples": len(depths),
+        "min_depth": depths[0],
+        "median_depth": int(median_low(depths)),
+        "max_depth": depths[-1],
+    }
+
+
+def write_readme(
+    out_dir: Path,
+    sampling_depth: int,
+    group_column: Optional[str],
+    alpha_metrics: List[str],
+    beta_metrics: List[str],
+    tax_levels: List[int],
+    taxonomy_present: bool,
+) -> None:
+    """Write a concise README.md describing the post-analysis bundle.
+
+    Args:
+        out_dir: Root output directory for post-analysis.
+        sampling_depth: Rarefaction depth used for diversity analyses.
+        group_column: Metadata column used for group significance tests (if any).
+        alpha_metrics: Alpha metrics computed.
+        beta_metrics: Beta metrics computed.
+        tax_levels: Taxonomic levels collapsed for barplots.
+        taxonomy_present: Whether taxonomy.qza was present.
+    """
+    lines = [
+        "# QIIME 2 Post-analysis Bundle",
+        "",
+        f"- **Sampling depth:** `{sampling_depth}`",
+        f"- **Group column:** `{group_column or 'NA'}`",
+        f"- **Alpha metrics:** {', '.join(alpha_metrics)}",
+        f"- **Beta metrics:** {', '.join(beta_metrics)}",
+        f"- **Taxonomy present:** {taxonomy_present}",
+        f"- **Taxa barplot levels:** {', '.join(map(str, tax_levels)) if taxonomy_present else 'n/a'}",
+        "",
+        "## Key folders",
+        "- `artifacts/` – intermediate QIIME 2 artifacts (distance matrices, PCoAs, collapsed tables, etc.)",
+        "- `visuals/` – QZV visualizations (and exported HTML/PDF if `--export_visuals` was used)",
+        "- `logs/` – per-step QIIME command logs",
+        "- `exports/` – exports of select QZVs for inspection/archiving (optional)",
+        "",
+        "## What was run",
+        "1. Feature table and representative sequences summarization",
+        "2. Core phylogenetic diversity metrics (alpha/beta) with PCoA + Emperor",
+        "3. Alpha and beta group significance (if group column provided)",
+        "4. Taxonomy collapse and barplots (if taxonomy present)",
+        "5. ANCOM differential abundance (if requested)",
+        "",
+        "This bundle is designed for quick QC and first-pass exploration.",
+        "For custom analyses, consider downstream R (phyloseq, vegan) or Python workflows.",
+        "",
+    ]
+    (out_dir / "README.md").write_text("\n".join(lines), encoding="utf-8")
+
+
+def write_summary_tsv(
+    out_dir: Path,
+    depth_stats: Dict[str, int],
+    sampling_depth: int,
+    taxonomy_present: bool,
+    alpha_metrics: List[str],
+    beta_metrics: List[str],
+    tax_levels: List[int],
+    group_column: Optional[str],
+) -> None:
+    """Write a summary TSV with high-level QC stats and configuration.
+
+    Args:
+        out_dir: Root output directory where `summary.tsv` will be written.
+        depth_stats: Dictionary with n_samples, min_depth, median_depth, max_depth.
+        sampling_depth: Rarefaction depth used.
+        taxonomy_present: Whether taxonomy.qza was present.
+        alpha_metrics: Alpha metrics computed.
+        beta_metrics: Beta metrics computed.
+        tax_levels: Taxonomy levels used for barplots (if any).
+        group_column: Grouping column name used for significance tests (if any).
+    """
+    rows = [
+        ("n_samples", depth_stats.get("n_samples", 0)),
+        ("min_depth", depth_stats.get("min_depth", 0)),
+        ("median_depth", depth_stats.get("median_depth", 0)),
+        ("max_depth", depth_stats.get("max_depth", 0)),
+        ("sampling_depth", sampling_depth),
+        ("taxonomy_present", int(bool(taxonomy_present))),
+        ("alpha_metrics", ",".join(alpha_metrics)),
+        ("beta_metrics", ",".join(beta_metrics)),
+        ("tax_levels", ",".join(map(str, tax_levels)) if taxonomy_present else "NA"),
+        ("group_column", group_column or "NA"),
+    ]
+    with (out_dir / "summary.tsv").open("w", encoding="utf-8", newline="") as fh:
+        writer = csv.writer(fh, delimiter="\t")
+        writer.writerow(["key", "value"])
+        writer.writerows(rows)
+
+
+# ----------------------------- main ----------------------------- #
+
+
+def main() -> None:
+    """CLI entrypoint for running the QIIME 2 post-analysis bundle."""
+    parser = argparse.ArgumentParser(
+        description="Run a standard QIIME 2 post-analysis bundle on denoised outputs."
+    )
+    parser.add_argument(
+        "--input_dir",
+        required=True,
+        type=Path,
+        help="Folder containing table.qza, rep-seqs.qza, rooted-tree.qza, metadata.tsv (and optional taxonomy.qza).",
+    )
+    parser.add_argument(
+        "--out_dir",
+        required=False,
+        type=Path,
+        help="Output directory for post-analysis (default: <input_dir>/post_analysis).",
+    )
+    parser.add_argument(
+        "--sampling_depth",
+        type=int,
+        default=None,
+        help="Rarefaction depth. If not provided, it is estimated from feature-table summarize.",
+    )
+    parser.add_argument(
+        "--group_column",
+        type=str,
+        default=None,
+        help="Metadata column for group significance tests (PERMANOVA, alpha group significance, ANCOM).",
+    )
+    parser.add_argument(
+        "--alpha_metrics",
+        type=str,
+        nargs="+",
+        default=["observed_features", "shannon", "faith_pd", "pielou_e"],
+        help="Alpha diversity metrics to compute.",
+    )
+    parser.add_argument(
+        "--beta_metrics",
+        type=str,
+        nargs="+",
+        default=["braycurtis", "jaccard", "unweighted_unifrac", "weighted_unifrac"],
+        help="Beta diversity metrics to compute.",
+    )
+    parser.add_argument(
+        "--tax_levels",
+        type=int,
+        nargs="+",
+        default=[2, 3, 4, 5, 6],
+        help="Taxonomy levels for collapsed barplots.",
+    )
+    parser.add_argument(
+        "--run_ancom",
+        action="store_true",
+        help="Run ANCOM using --group_column.",
+    )
+    parser.add_argument(
+        "--threads",
+        type=int,
+        default=8,
+        help="Threads for heavy steps.",
+    )
+
+    parser.add_argument(
+        "--min_overall",
+        type=float,
+        default=0.85,
+        help="Minimum overall retention fraction required for depth recommendation (default: 0.85).",
+    )
+    parser.add_argument(
+        "--min_each_group",
+        type=float,
+        default=0.75,
+        help="Minimum per-group retention fraction required for depth recommendation (default: 0.75).",
+    )
+    parser.add_argument(
+        "--depth_report_dir",
+        type=Path,
+        default=None,
+        help="Optional subfolder to write depth recommendation TSVs (default: <out_dir>/depth_recommendation).",
+    )
+
+
+    parser.add_argument(
+            "--pdf_engine",
+            type=str,
+            choices=["auto", "chrome", "wkhtmltopdf", "none"],
+            default="auto",
+            help=(
+                "How to render PDFs from exported QZVs. "
+                "'chrome' uses headless Chromium/Chrome if found; "
+                "'wkhtmltopdf' uses wkhtmltopdf; "
+                "'auto' tries Chrome first then wkhtmltopdf; "
+                "'none' disables PDF rendering."
+            ),
+        )
+
+    parser.add_argument(
+        "--export_visuals",
+        action="store_true",
+        help="Export .qzv visuals to HTML folders; try to render PDFs if Chrome is present.",
+    )
+
+    args = parser.parse_args()
+    base = args.input_dir.resolve()
+    out = (args.out_dir or (base / "post_analysis")).resolve()
+
+    viz = out / "visuals"
+    art = out / "artifacts"
+    logs = out / "logs"
+    for d in (viz, art, logs):
+        d.mkdir(parents=True, exist_ok=True)
+
+    log = setup_logging(out)
+    log.info("INPUT_DIR=%s", base)
+    log.info("OUT_DIR=%s", out)
+
+    # Required inputs
+    ensure_files(base, ["table.qza", "rep-seqs.qza", "rooted-tree.qza", "metadata.tsv"])
+    table = base / "table.qza"
+    repseqs = base / "rep-seqs.qza"
+    tree = base / "rooted-tree.qza"
+    metadata = base / "metadata.tsv"
+    taxonomy_present = (base / "taxonomy.qza").exists()
+    taxonomy = base / "taxonomy.qza" if taxonomy_present else None
+
+    # 0) Basic summaries first (also helps choose depth)
+    ft_summary_qzv = viz / "feature_table_summary.qzv"
+    run(
+        [
+            "qiime",
+            "feature-table",
+            "summarize",
+            "--i-table",
+            str(table),
+            "--o-visualization",
+            str(ft_summary_qzv),
+            "--m-sample-metadata-file",
+            str(metadata),
+        ],
+        log,
+        logs / "feature_table_summarize.log",
+    )
+
+    repseqs_tab_qzv = viz / "repseqs_tabulate_seqs.qzv"
+    run(
+        [
+            "qiime",
+            "feature-table",
+            "tabulate-seqs",
+            "--i-data",
+            str(repseqs),
+            "--o-visualization",
+            str(repseqs_tab_qzv),
+        ],
+        log,
+        logs / "tabulate_seqs.log",
+    )
+
+    # Export summary and compute depth recommendation (balanced by group if possible)
+    exp_dir = out / "exports" / "feature_table_summary"
+    export_qzv(ft_summary_qzv, exp_dir, log)
+    depth_stats = summarize_depths(exp_dir)
+
+    # Respect explicit user depth if provided
+    depth = args.sampling_depth
+
+    # Where to write the depth report (TSVs)
+    depth_report_dir = args.depth_report_dir or (out / "depth_recommendation")
+
+    if depth is None:
+        # Try the balanced recommender first (requires valid group column)
+        depth = recommend_rarefaction_depth(
+            summary_export_dir=exp_dir,
+            metadata_tsv=metadata,
+            group_column=args.group_column,
+            out_dir=depth_report_dir,
+            min_overall=args.min_overall,
+            min_each_group=args.min_each_group,
+            log=log,
+        )
+
+    if depth is None:
+        # Fall back to robust ~15th percentile heuristic
+        depth = infer_sampling_depth_from_summary(exp_dir)
+        if depth is not None:
+            log.info("Depth (percentile heuristic): %d", depth)
+
+    if depth is None:
+        # Final safety default
+        log.warning("Could not infer sampling depth; defaulting to 10000.")
+        depth = 10000
+
+    log.info("Using sampling depth: %d", depth)
+
+
+    # 1) Core metrics (phylogenetic)
+    core_dir = art / "core_metrics"
+    run(
+        [
+            "qiime",
+            "diversity",
+            "core-metrics-phylogenetic",
+            "--i-phylogeny",
+            str(tree),
+            "--i-table",
+            str(table),
+            "--p-sampling-depth",
+            str(depth),
+            "--m-metadata-file",
+            str(metadata),
+            "--p-n-jobs-or-threads",
+            str(args.threads),
+            "--output-dir",
+            str(core_dir),
+        ],
+        log,
+        logs / "core_metrics_phylogenetic.log",
+    )
+
+    # 2) Alpha diversity (vectors) + group significance
+    for metric in args.alpha_metrics:
+        vec = core_dir / f"{metric}_vector.qza"
+        if not vec.exists():
+            vec = art / f"{metric}_vector.qza"
+            run(
+                [
+                    "qiime",
+                    "diversity",
+                    "alpha",
+                    "--i-table",
+                    str(table),
+                    "--p-metric",
+                    metric,
+                    "--o-alpha-diversity",
+                    str(vec),
+                ],
+                log,
+                logs / f"alpha_{metric}.log",
+            )
+        if args.group_column:
+            viz_alpha = viz / f"alpha_{metric}_by_{args.group_column}.qzv"
+            run(
+                [
+                    "qiime",
+                    "diversity",
+                    "alpha-group-significance",
+                    "--i-alpha-diversity",
+                    str(vec),
+                    "--m-metadata-file",
+                    str(metadata),
+                    "--o-visualization",
+                    str(viz_alpha),
+                ],
+                log,
+                logs / f"alpha_group_{metric}.log",
+            )
+
+    # 3) Beta diversity: distances, PCoA + Emperor + PERMANOVA if group column
+    for metric in args.beta_metrics:
+        dist = art / f"{metric}_distance.qza"
+        run(
+            [
+                "qiime",
+                "diversity",
+                "beta",
+                "--i-table",
+                str(table),
+                "--p-metric",
+                metric,
+                "--o-distance-matrix",
+                str(dist),
+            ],
+            log,
+            logs / f"beta_{metric}.log",
+        )
+
+        pcoa = art / f"{metric}_pcoa.qza"
+        run(
+            ["qiime", "diversity", "pcoa", "--i-distance-matrix", str(dist), "--o-pcoa", str(pcoa)],
+            log,
+            logs / f"pcoa_{metric}.log",
+        )
+
+        emp = viz / f"{metric}_emperor.qzv"
+        run(
+            [
+                "qiime",
+                "emperor",
+                "plot",
+                "--i-pcoa",
+                str(pcoa),
+                "--m-metadata-file",
+                str(metadata),
+                "--o-visualization",
+                str(emp),
+            ],
+            log,
+            logs / f"emperor_{metric}.log",
+        )
+
+        if args.group_column:
+            bg = viz / f"{metric}_PERMANOVA_{args.group_column}.qzv"
+            run(
+                [
+                    "qiime",
+                    "diversity",
+                    "beta-group-significance",
+                    "--i-distance-matrix",
+                    str(dist),
+                    "--m-metadata-file",
+                    str(metadata),
+                    "--m-metadata-column",
+                    args.group_column,
+                    "--o-visualization",
+                    str(bg),
+                    "--p-pairwise",
+                ],
+                log,
+                logs / f"beta_group_{metric}.log",
+            )
+
+    # 4) Taxonomy barplots at specified levels (if taxonomy available)
+    if taxonomy_present and taxonomy:
+        for level in args.tax_levels:
+            collapsed = art / f"table_L{level}.qza"
+            run(
+                [
+                    "qiime",
+                    "taxa",
+                    "collapse",
+                    "--i-table",
+                    str(table),
+                    "--i-taxonomy",
+                    str(taxonomy),
+                    "--p-level",
+                    str(level),
+                    "--o-collapsed-table",
+                    str(collapsed),
+                ],
+                log,
+                logs / f"taxa_collapse_L{level}.log",
+            )
+            bp = viz / f"taxa_barplot_L{level}.qzv"
+            run(
+                [
+                    "qiime",
+                    "taxa",
+                    "barplot",
+                    "--i-table",
+                    str(collapsed),
+                    "--i-taxonomy",
+                    str(taxonomy),
+                    "--m-metadata-file",
+                    str(metadata),
+                    "--o-visualization",
+                    str(bp),
+                ],
+                log,
+                logs / f"taxa_barplot_L{level}.log",
+            )
+    else:
+        log.info("taxonomy.qza not found; skipping taxonomy barplots.")
+
+    # 5) ANCOM (optional; requires group column)
+    if args.run_ancom and args.group_column:
+        comp = art / "composition_table.qza"
+        run(
+            [
+                "qiime",
+                "composition",
+                "add-pseudocount",
+                "--i-table",
+                str(table),
+                "--o-composition-table",
+                str(comp),
+            ],
+            log,
+            logs / "composition_add_pseudocount.log",
+        )
+        ancom_viz = viz / f"ancom_{args.group_column}.qzv"
+        run(
+            [
+                "qiime",
+                "composition",
+                "ancom",
+                "--i-table",
+                str(comp),
+                "--m-metadata-file",
+                str(metadata),
+                "--m-metadata-column",
+                args.group_column,
+                "--o-visualization",
+                str(ancom_viz),
+            ],
+            log,
+            logs / "ancom.log",
+        )
+    elif args.run_ancom and not args.group_column:
+        log.warning("--run_ancom was set but no --group_column provided; skipping ANCOM.")
+
+    # 6) Optional: export visuals (+ attempt PDF rendering)
+    if args.export_visuals:
+        export_root = out / "exports"
+        export_root.mkdir(parents=True, exist_ok=True)
+        for qzv in viz.glob("*.qzv"):
+            dest = export_root / qzv.stem
+            export_qzv(qzv, dest, log)
+            try_html_to_pdf(dest, log, args.pdf_engine)
+
+
+    # 7) README + summary TSV
+    write_readme(
+        out_dir=out,
+        sampling_depth=depth,
+        group_column=args.group_column,
+        alpha_metrics=args.alpha_metrics,
+        beta_metrics=args.beta_metrics,
+        tax_levels=args.tax_levels,
+        taxonomy_present=taxonomy_present,
+    )
+    write_summary_tsv(
+        out_dir=out,
+        depth_stats=depth_stats,
+        sampling_depth=depth,
+        taxonomy_present=taxonomy_present,
+        alpha_metrics=args.alpha_metrics,
+        beta_metrics=args.beta_metrics,
+        tax_levels=args.tax_levels,
+        group_column=args.group_column,
+    )
+
+    # 8) HTML landing page
+    write_html_index(out)
+    log.info("Wrote index.html")
+
+    log.info("Done. Outputs in: %s", out)
+
+
+if __name__ == "__main__":
+    main()
