@@ -89,6 +89,48 @@ def setup_logging(out_dir: Path) -> logging.Logger:
     return logger
 
 
+def run_optional(
+    *,
+    cmd: list[str],
+    log: logging.Logger,
+    logfile: Optional[Path] = None,
+    warn: str = "Step failed; skipping.",
+) -> bool:
+    """
+    Run a subprocess command; on failure, log a warning and continue.
+
+    Parameters
+    ----------
+    cmd : list[str]
+        Command tokens to execute.
+    log : logging.Logger
+        Logger used to emit messages.
+    logfile : pathlib.Path, optional
+        If provided, stdout/stderr are appended to this file.
+    warn : str
+        Warning message to emit on failure.
+
+    Returns
+    -------
+    bool
+        True if the command succeeded, False if it failed.
+    """
+    log.info("▶ %s", " ".join(cmd))
+    try:
+        if logfile:
+            logfile.parent.mkdir(parents=True, exist_ok=True)
+            with logfile.open("a", encoding="utf-8") as lf:
+                lf.write("$ " + " ".join(cmd) + "\n")
+                lf.flush()
+                subprocess.run(cmd, stdout=lf, stderr=lf, check=True)
+        else:
+            subprocess.run(cmd, check=True)
+        return True
+    except subprocess.CalledProcessError as exc:
+        log.warning("%s (exit=%s)", warn, exc.returncode)
+        return False
+
+
 def run(cmd: List[str], log: logging.Logger, logfile: Optional[Path] = None) -> None:
     """Run a subprocess command and optionally tee to a step log.
 
@@ -168,112 +210,6 @@ def _find_sample_frequency_file(
             except Exception:  # nosec B902 - broad on purpose, we just skip candidates
                 continue
     return None
-
-
-
-def _biom_to_depths_via_tsv(
-    *,
-    biom_path: Path,
-    work_dir: Path,
-) -> "pd.DataFrame":
-    """
-    Convert a BIOM matrix to TSV and compute per-sample read depths.
-
-    Requires the ``biom`` CLI (available in QIIME environments). The TSV is
-    parsed to sum counts across features per sample.
-
-    Parameters
-    ----------
-    biom_path : pathlib.Path
-        Path to ``feature-table.biom``.
-    work_dir : pathlib.Path
-        Working directory to store the temporary TSV output.
-
-    Returns
-    -------
-    pandas.DataFrame
-        Data frame with columns ``sample-id`` (str) and ``depth`` (int).
-
-    Raises
-    ------
-    ValueError
-        If the converted TSV has an unexpected layout.
-    """
-
-    work_dir.mkdir(parents=True, exist_ok=True)
-    tsv_path = work_dir / "feature-table.tsv"
-
-    cmd = [
-        "biom",
-        "convert",
-        "--to-tsv",
-        "--input-fp",
-        str(biom_path),
-        "--output-fp",
-        str(tsv_path),
-    ]
-    subprocess.run(  # nosec B603
-        cmd,
-        check=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-    )
-
-    df = pd.read_csv(tsv_path, sep="\t", comment="#", dtype=str)
-    if df.empty or df.shape[1] < 2:
-        raise ValueError(f"Unexpected BIOM TSV layout in {tsv_path}")
-
-    sample_cols = list(df.columns[1:])
-    numeric = df[sample_cols].apply(pd.to_numeric, errors="coerce").fillna(0)
-    depths = numeric.sum(axis=0).astype(int).reset_index()
-    depths.columns = ["sample-id", "depth"]
-    return depths
-
-
-def _load_depths_fallback_from_table(
-    *,
-    table_qza: Path,
-    out_dir: Path,
-    log: logging.Logger,
-) -> Optional["pd.DataFrame"]:
-    """
-    Derive per-sample depths from ``table.qza`` when QZV export lacks TSVs.
-
-    This uses ``qiime tools export`` followed by ``biom convert`` to obtain a
-    TSV matrix, from which per-sample depths are computed.
-
-    Parameters
-    ----------
-    table_qza : pathlib.Path
-        Path to ``table.qza``.
-    out_dir : pathlib.Path
-        Base output directory where export artefacts can be written.
-    log : logging.Logger
-        Logger used for progress messages.
-
-    Returns
-    -------
-    pandas.DataFrame or None
-        Data frame with columns ``sample-id`` and ``depth`` if successful,
-        otherwise ``None`` (a warning is logged).
-    """
-    try:
-        biom_dir = out_dir / "exports" / "table_export"
-        biom_path = _export_table_biom(
-            table_qza=table_qza,
-            export_dir=biom_dir,
-            log=log,
-        )
-        work_dir = biom_dir / "tmp"
-        depths = _biom_to_depths_via_tsv(
-            biom_path=biom_path,
-            work_dir=work_dir,
-        )
-        log.info("Derived per-sample depths from feature table (BIOM → TSV).")
-        return depths
-    except Exception as exc:  # nosec B902 - broad on purpose, we log and return None
-        log.warning("Fallback depth derivation from table.qza failed: %s", exc)
-        return None
 
 
 def _load_depths_from_export(*, sample_freq_tsv: Path) -> pd.DataFrame:
@@ -455,7 +391,8 @@ def recommend_rarefaction_depth(
         # 1) Prefer a QZV-exported frequency file if present
         freq_file = _find_sample_frequency_file(export_dir=summary_export_dir, log=log)
         if freq_file:
-            depths = _load_depths_from_export(sample_freq_file=freq_file)
+            depths = _load_depths_from_export(sample_freq_tsv=freq_file)
+
             log.info("Loaded per-sample depths from %s", freq_file)
         else:
             # 2) Fallback: compute depths from feature table directly (BIOM → TSV)
@@ -860,6 +797,44 @@ def _export_table_biom(*, table_qza: Path, export_dir: Path, log: logging.Logger
         )
     return biom_path
 
+def _group_counts_after_rarefy(
+    *,
+    rarefied_table: Path,
+    metadata_tsv: Path,
+    group_column: str,
+) -> dict[str, int]:
+    """
+    Estimate per-group sample counts among samples retained after rarefaction.
+
+    Returns a dict mapping group -> count. If detection fails, returns {}.
+    """
+    try:
+        # Export BIOM
+        tmp = rarefied_table.parent / "tmp_counts"
+        tmp.mkdir(parents=True, exist_ok=True)
+        subprocess.run(
+            ["qiime", "tools", "export", "--input-path", str(rarefied_table), "--output-path", str(tmp)],
+            check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        )
+        biom_fp = tmp / "feature-table.biom"
+        tsv_fp = tmp / "feature-table.tsv"
+        subprocess.run(
+            ["biom", "convert", "--to-tsv", "--input-fp", str(biom_fp), "--output-fp", str(tsv_fp)],
+            check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        )
+        # Second line header lists sample IDs
+        with tsv_fp.open("r", encoding="utf-8") as fh:
+            _ = fh.readline()
+            header = fh.readline().strip().split("\t")[1:]
+
+        md = pd.read_csv(metadata_tsv, sep="\t", dtype=str, comment="#")
+        md.rename(columns={md.columns[0]: "sample-id"}, inplace=True)
+        md["sample-id"] = md["sample-id"].astype(str).str.strip()
+        kept = md[md["sample-id"].isin(header)]
+        return kept[group_column].value_counts(dropna=False).to_dict()
+    except Exception:
+        return {}
+
 
 def _biom_to_depths_via_tsv(
     *,
@@ -1199,7 +1174,7 @@ def main() -> None:
         type=int,
         default=5,
         help="Minimum rarefaction depth floor; if the recommended depth is lower, "
-            "this floor will be used instead (default: 100).",
+            "this floor will be used instead (default: 5).",
     )
 
     parser.add_argument(
@@ -1380,30 +1355,51 @@ def main() -> None:
         logs / "core_metrics_phylogenetic.log",
     )
 
+
     # 2) Alpha diversity vectors + group significance (consistent with rarefaction)
+    skip_alpha = False
     rarefied = core_dir / "rarefied_table.qza"
-    for metric in args.alpha_metrics:
-        vec = _alpha_vectors_for_metric(
-            metric=metric,
-            core_dir=core_dir,
-            art_dir=art,
+    if args.group_column:
+        gc = _group_counts_after_rarefy(
             rarefied_table=rarefied,
-            table_raw=table,  # not used now, but kept for clarity
-            log=log,
-            logs_dir=logs,
+            metadata_tsv=metadata,
+            group_column=args.group_column,
         )
-        if args.group_column:
-            viz_alpha = viz / f"alpha_{metric}_by_{args.group_column}.qzv"
-            run(
-                [
-                    "qiime", "diversity", "alpha-group-significance",
-                    "--i-alpha-diversity", str(vec),
-                    "--m-metadata-file", str(metadata),
-                    "--o-visualization", str(viz_alpha),
-                ],
-                log,
-                logs / f"alpha_group_{metric}.log",
+        if gc:
+            too_small = {k: v for k, v in gc.items() if int(v) < 2}
+            if too_small:
+                log.warning(
+                    "Skipping alpha-group-significance: too few samples per group after rarefaction: %s",
+                    too_small,
+                )
+                skip_alpha = True
+
+    if not skip_alpha:
+        
+        for metric in args.alpha_metrics:
+            vec = _alpha_vectors_for_metric(
+                metric=metric,
+                core_dir=core_dir,
+                art_dir=art,
+                rarefied_table=rarefied,
+                table_raw=table,
+                log=log,
+                logs_dir=logs,
             )
+            if args.group_column:
+                viz_alpha = viz / f"alpha_{metric}_by_{args.group_column}.qzv"
+                run_optional(
+                    cmd=[
+                        "qiime", "diversity", "alpha-group-significance",
+                        "--i-alpha-diversity", str(vec),
+                        "--m-metadata-file", str(metadata),
+                        "--p-ignore-missing-samples",  # <<< makes it tolerant
+                        "--o-visualization", str(viz_alpha),
+                    ],
+                    log=log,
+                    logfile=logs / f"alpha_group_{metric}.log",
+                    warn=f"alpha-group-significance failed for {metric}; skipping.",
+                )
 
 
     # 3) Beta diversity: distances, PCoA + Emperor + PERMANOVA if group column
