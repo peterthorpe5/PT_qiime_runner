@@ -477,6 +477,14 @@ def build_manifest(
         files=fastqs, stem_regex=stem_re, r1_pattern=r1_pattern, r2_pattern=r2_pattern
     )
 
+    # Warn if stems lack R1/R2 after grouping (common when patterns are too strict)
+    empty_pairs = [s for s, rr in groups.items() if not rr["R1"] or not rr["R2"]]
+    if empty_pairs:
+        print(f"[WARN] {len(empty_pairs)} stems lack complete R1/R2 pairs. "
+            f"Consider using --r1-pattern _R1 and --r2-pattern _R2. "
+            f"Example: {empty_pairs[:3]}", flush=True)
+
+
     if metadata_tsv:
         if not sample_id_column:
             raise ValueError("--sample-id-column is required when --metadata-tsv is provided.")

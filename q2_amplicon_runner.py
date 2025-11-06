@@ -39,6 +39,15 @@ from tempfile import NamedTemporaryFile
 import stat
 import os
 import logging
+import time
+try:
+    import psutil
+except Exception:
+    psutil = None
+
+
+# Wall-clock start for runtime/elapsed logging
+_SCRIPT_START_TIME = time.time()
 
 
 V34_FWD = "CCTACGGGNGGCWGCAG"
@@ -181,43 +190,67 @@ def log_memory_usage(
     extra_msg: str | None = None,
 ) -> None:
     """
-    Log the current and peak memory usage (resident set size).
+    Log the current and peak memory usage (resident set size), plus elapsed time.
 
     Parameters
     ----------
     logger : logging.Logger
-        Logger instance.
+        Logger instance to emit the message.
     prefix : str
-        Optional prefix for the log message.
+        Optional prefix (e.g., 'START', 'END', or a pipeline stage label).
     extra_msg : str | None
-        Optional additional message.
+        Optional extra text appended to the log message.
     """
-    process = psutil.Process(os.getpid())
-    mem_bytes = process.memory_info().rss
-    mem_gb = mem_bytes / (1024 ** 3)
-
+    cur_gb = None
     peak_gb = None
+
+    # Try psutil for current RSS; fall back to /proc/self/status on Linux
+    if psutil is not None:
+        try:
+            cur_gb = psutil.Process(os.getpid()).memory_info().rss / (1024 ** 3)
+        except Exception:
+            cur_gb = None
+
+    if cur_gb is None:
+        # very light fallback: try /proc/self/status VmRSS
+        try:
+            with open("/proc/self/status", "r", encoding="utf-8", errors="ignore") as fh:
+                for line in fh:
+                    if line.startswith("VmRSS:"):
+                        kb = float(line.split()[1])
+                        cur_gb = kb / (1024 ** 2)
+                        break
+        except Exception:
+            cur_gb = None
+
+    # Peak RSS via resource (kilobytes on Linux)
     try:
-        # ru_maxrss is kilobytes on Linux
-        import resource  # noqa: PLC0415
-
-        peak_rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+        import resource  # local import to avoid platform issues
+        peak_kb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+        # Linux reports KB, macOS reports bytes
         if os.uname().sysname == "Linux":
-            peak_gb = peak_rss / (1024 ** 2)
+            peak_gb = peak_kb / (1024 ** 2)
         else:
-            peak_gb = peak_rss / (1024 ** 3)
+            peak_gb = peak_kb / (1024 ** 3)
     except Exception:
-        pass
+        peak_gb = None
 
-    elapsed = time.time() - _SCRIPT_START_TIME
-    msg = f"{prefix} Memory usage: {mem_gb:.2f} GB (resident set size)"
+    # Elapsed wall time
+    elapsed_s = max(0.0, time.time() - _SCRIPT_START_TIME)
+    elapsed_min = elapsed_s / 60.0
+
+    parts = []
+    if prefix:
+        parts.append(prefix.strip())
+    if cur_gb is not None:
+        parts.append(f"RAM: {cur_gb:.2f} GB")
     if peak_gb is not None:
-        msg += f", Peak: {peak_gb:.2f} GB"
-    msg += f", Elapsed: {elapsed/60:.1f} min"
+        parts.append(f"Peak: {peak_gb:.2f} GB")
+    parts.append(f"Elapsed: {elapsed_min:.1f} min")
     if extra_msg:
-        msg += " | " + extra_msg
-    logger.info(msg)
+        parts.append(extra_msg)
 
+    logger.info(" | ".join(parts))
 
 
 
@@ -1259,11 +1292,14 @@ def main() -> None:
     args = build_arg_parser().parse_args()
     logger = setup_logging(out_dir=args.out_dir, run_label=args.run_label)
 
+    # Log explicit start time and initial RAM
+    logger.info("Start time: %s", time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(_SCRIPT_START_TIME)))
+    log_memory_usage(logger=logger, prefix="START")
+
     args.out_dir = Path(args.out_dir).expanduser().resolve()
     args.manifest = Path(args.manifest).expanduser().resolve()
     args.metadata_tsv = Path(args.metadata_tsv).expanduser().resolve()
 
-    logger = setup_logging(out_dir=args.out_dir, run_label=args.run_label)
     logger.info("CWD=%s", Path.cwd())
     logger.info("Denoiser=%s | Pair strategy=%s", args.denoiser, args.pair_strategy)
 
@@ -1535,6 +1571,10 @@ def main() -> None:
     # QC bundle (lives in results/<RUN>/qc)
     run_qc_bundle(paths=paths, metadata_tsv=fixed_meta, denoiser=args.denoiser, logger=logger)
     logger.info("QC bundle written to: %s", paths.root / "qc")
+    end_ts = time.time()
+    logger.info("End time: %s", time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(end_ts)))
+    log_memory_usage(logger=logger, prefix="END", extra_msg="Pipeline complete")
+
 
 
 
