@@ -285,194 +285,240 @@ def run_cmd(*, cmd: list[str], log_file: Path, logger: Optional[logging.Logger] 
         subprocess.run(cmd, stdout=lf, stderr=lf, check=True)
 
 
-
-def run_qc_bundle(*, paths: Paths, metadata_tsv: Path, denoiser: str, logger=None) -> None:
+def run_qc_bundle(
+    *, paths: Paths, metadata_tsv: Path, denoiser: str,
+    logger: Optional[logging.Logger] = None
+) -> None:
     """
-    Generate a standard QC bundle of QIIME 2 visualizations and text summaries.
+    Build a standard QC bundle of QIIME 2 visualisations and text summaries.
 
-    This function consumes core artifacts produced by the pipeline (feature table,
-    representative sequences, rooted tree, optional taxonomy) and writes a set of
-    useful .qzv visualizations and lightweight TSV/TXT summaries under
-    ``<paths.root>/qc``. It is safe to call regardless of which artifacts exist;
-    steps are skipped if their inputs are missing.
+    The function consumes core artefacts (feature table, representative
+    sequences, rooted tree, optional taxonomy) and writes .qzv outputs and a
+    few lightweight TSV/TXT summaries under ``<paths.root>/qc``. It is safe to
+    call regardless of which artefacts exist; steps are skipped if inputs are
+    missing.
 
     Created outputs (when inputs are available):
-        - feature-table_summarize.qzv
-        - tabulate-seqs.qzv
-        - dada2_stats.qzv (if ``denoiser == "dada2_paired"`` and stats present)
-        - deblur_stats.qzv (if ``denoiser == "deblur_single"`` and stats present)
-        - taxa-barplot.qzv (if taxonomy present)
-        - alpha-rarefaction.qzv (if rooted tree present; max depth = 10,000)
-        - sample_depths.txt  (BIOM per-sample depth summary)
-        - asv_lengths.tsv    (FeatureID → ASV length, from rep-seqs FASTA)
-        - export_table/ and export_repseqs/ (raw exports to support the summaries)
-
-    The function shells out to QIIME 2 CLI (e.g., ``qiime feature-table summarize``),
-    and to BIOM for depth summaries. Command stdout/stderr are captured in
-    ``<paths.logs>/qc_*.log`` via the existing ``run_cmd`` helper.
-
-    Args:
-        paths (Paths): Pipeline directory container. Uses:
-            - ``paths.qza`` for ``table.qza``, ``rep-seqs.qza``, stats artifacts.
-            - ``paths.taxonomy`` for ``taxonomy.qza`` (optional).
-            - ``paths.phylogeny`` for ``rooted-tree.qza`` (optional).
-            - ``paths.logs`` for step log files.
-            - ``paths.root`` to create the ``qc/`` folder.
-        metadata_tsv (Path): Sample metadata TSV to annotate visualizations.
-        denoiser (str): One of ``"dada2_paired"`` or ``"deblur_single"``, used to
-            decide which stats visualization to build.
-        logger (logging.Logger | None): Optional logger for progress messages.
-
-    Returns:
-        None: Writes files to disk; no value is returned.
-
-    Raises:
-        subprocess.CalledProcessError: Propagated if a QIIME 2/BIOM command fails.
-        OSError: If underlying file operations (export, write) fail.
-
-    Notes:
-        - The function attempts best-effort plain-text summaries even if some
-          visualizations are skipped.
-        - Re-running will overwrite QC visualizations; exported folders are reused
-          or replaced as needed.
+      - feature-table_summarize.qzv
+      - tabulate-seqs.qzv
+      - dada2_stats.qzv (if denoiser == "dada2_paired")
+      - deblur_stats.qzv (if denoiser == "deblur_single")
+      - taxa-barplot.qzv (if taxonomy present)
+      - alpha-rarefaction.qzv (if rooted tree present; max depth = 10,000)
+      - sample_depths.txt  (BIOM per-sample depth summary)
+      - asv_lengths.tsv    (FeatureID → ASV length, from rep-seqs FASTA)
+      - export_table/, export_repseqs/ (raw exports used by summaries)
     """
-    qza = paths.qza
-    qzv = paths.qzv
+    qza_dir = paths.qza
+    qzv_dir = paths.qzv
     logs = paths.logs
+
     out_qc = paths.root / "qc"
     out_qc.mkdir(parents=True, exist_ok=True)
 
-    table_qza      = qza / "table.qza"
-    repseqs_qza    = qza / "rep-seqs.qza"
-    rooted_tree_qza= paths.phylogeny / "rooted-tree.qza"
-    stats_qza      = qza / "denoise-stats.qza"          # DADA2
-    deblur_stats_qza = qza / "deblur_stats.qza"         # Deblur (if present)
-    taxonomy_qza   = paths.taxonomy / "taxonomy.qza"
+    # Prefer filtered artefacts when present (avoids ID mismatches in QC).
+    table_filtered = qza_dir / "table.lengthfilter.qza"
+    rep_filtered = qza_dir / "rep-seqs.lengthfilter.qza"
 
-    # 1) Feature-table summarize (+ metadata, so sample groups show)
-    run_cmd(cmd=[
-        "qiime","feature-table","summarize",
-        "--i-table", str(table_qza),
-        "--m-sample-metadata-file", str(metadata_tsv),
-        "--o-visualization", str(out_qc / "feature-table_summarize.qzv"),
-    ], log_file=logs / "qc_feature_table_summarize.log", logger=logger)
+    table_qza = table_filtered if table_filtered.exists() else qza_dir / "table.qza"
+    repseqs_qza = (
+        rep_filtered if rep_filtered.exists() else qza_dir / "rep-seqs.qza"
+    )
+
+    rooted_tree_qza = paths.phylogeny / "rooted-tree.qza"
+    stats_qza = qza_dir / "denoise-stats.qza"          # DADA2
+    deblur_stats_qza = qza_dir / "deblur_stats.qza"    # Deblur (if present)
+    taxonomy_qza = paths.taxonomy / "taxonomy.qza"
+
+    # 1) Feature-table summarize (+ metadata so sample groups show)
+    if table_qza.exists():
+        run_cmd(
+            cmd=[
+                "qiime", "feature-table", "summarize",
+                "--i-table", str(table_qza),
+                "--m-sample-metadata-file", str(metadata_tsv),
+                "--o-visualization", str(out_qc / "feature-table_summarize.qzv"),
+            ],
+            log_file=logs / "qc_feature_table_summarize.log",
+            logger=logger,
+        )
 
     # 2) Tabulate representative sequences
-    run_cmd(cmd=[
-        "qiime","feature-table","tabulate-seqs",
-        "--i-data", str(repseqs_qza),
-        "--o-visualization", str(out_qc / "tabulate-seqs.qzv"),
-    ], log_file=logs / "qc_tabulate_seqs.log", logger=logger)
+    if repseqs_qza.exists():
+        run_cmd(
+            cmd=[
+                "qiime", "feature-table", "tabulate-seqs",
+                "--i-data", str(repseqs_qza),
+                "--o-visualization", str(out_qc / "tabulate-seqs.qzv"),
+            ],
+            log_file=logs / "qc_tabulate_seqs.log",
+            logger=logger,
+        )
 
     # 3) Denoiser stats visual
     if denoiser == "dada2_paired" and stats_qza.exists():
-        run_cmd(cmd=[
-            "qiime","metadata","tabulate",
-            "--m-input-file", str(stats_qza),
-            "--o-visualization", str(out_qc / "dada2_stats.qzv"),
-        ], log_file=logs / "qc_dada2_stats.log", logger=logger)
+        run_cmd(
+            cmd=[
+                "qiime", "metadata", "tabulate",
+                "--m-input-file", str(stats_qza),
+                "--o-visualization", str(out_qc / "dada2_stats.qzv"),
+            ],
+            log_file=logs / "qc_dada2_stats.log",
+            logger=logger,
+        )
     elif denoiser == "deblur_single" and deblur_stats_qza.exists():
-        run_cmd(cmd=[
-            "qiime","deblur","visualize-stats",
-            "--i-deblur-stats", str(deblur_stats_qza),
-            "--o-visualization", str(out_qc / "deblur_stats.qzv"),
-        ], log_file=logs / "qc_deblur_stats.log", logger=logger)
+        run_cmd(
+            cmd=[
+                "qiime", "deblur", "visualize-stats",
+                "--i-deblur-stats", str(deblur_stats_qza),
+                "--o-visualization", str(out_qc / "deblur_stats.qzv"),
+            ],
+            log_file=logs / "qc_deblur_stats.log",
+            logger=logger,
+        )
 
-    # 4) Taxa barplots (if taxonomy present)
-    if taxonomy_qza.exists():
-        run_cmd(cmd=[
-            "qiime","taxa","barplot",
-            "--i-table", str(table_qza),
-            "--i-taxonomy", str(taxonomy_qza),
-            "--m-metadata-file", str(metadata_tsv),
-            "--o-visualization", str(out_qc / "taxa-barplot.qzv"),
-        ], log_file=logs / "qc_taxa_barplot.log", logger=logger)
+    # 4) Taxa barplots (only if taxonomy + table exist)
+    if taxonomy_qza.exists() and table_qza.exists():
+        run_cmd(
+            cmd=[
+                "qiime", "taxa", "barplot",
+                "--i-table", str(table_qza),
+                "--i-taxonomy", str(taxonomy_qza),
+                "--m-metadata-file", str(metadata_tsv),
+                "--o-visualization", str(out_qc / "taxa-barplot.qzv"),
+            ],
+            log_file=logs / "qc_taxa_barplot.log",
+            logger=logger,
+        )
 
-    # 5) Alpha-rarefaction (if tree available)
-    if rooted_tree_qza.exists():
-        # choose a conservative max depth; users can re-run if they want a different one
-        # 10000 is often fine; change if your samples are deeper
-        run_cmd(cmd=[
-            "qiime","diversity","alpha-rarefaction",
-            "--i-table", str(table_qza),
-            "--i-phylogeny", str(rooted_tree_qza),
-            "--m-metadata-file", str(metadata_tsv),
-            "--p-max-depth","10000",
-            "--o-visualization", str(out_qc / "alpha-rarefaction.qzv"),
-        ], log_file=logs / "qc_alpha_rarefaction.log", logger=logger)
+    # 5) Alpha-rarefaction (requires tree + table)
+    if rooted_tree_qza.exists() and table_qza.exists():
+        run_cmd(
+            cmd=[
+                "qiime", "diversity", "alpha-rarefaction",
+                "--i-table", str(table_qza),
+                "--i-phylogeny", str(rooted_tree_qza),
+                "--m-metadata-file", str(metadata_tsv),
+                "--p-max-depth", "10000",
+                "--o-visualization", str(out_qc / "alpha-rarefaction.qzv"),
+            ],
+            log_file=logs / "qc_alpha_rarefaction.log",
+            logger=logger,
+        )
 
     # 6) Plain-text quick summaries
     # 6a) per-sample depths via BIOM
     export_dir = out_qc / "export_table"
-    export_dir.mkdir(exist_ok=True)
-    run_cmd(cmd=[
-        "qiime","tools","export",
-        "--input-path", str(table_qza),
-        "--output-path", str(export_dir),
-    ], log_file=logs / "qc_export_table.log", logger=logger)
+    export_dir.mkdir(parents=True, exist_ok=True)
+
+    if table_qza.exists():
+        run_cmd(
+            cmd=[
+                "qiime", "tools", "export",
+                "--input-path", str(table_qza),
+                "--output-path", str(export_dir),
+            ],
+            log_file=logs / "qc_export_table.log",
+            logger=logger,
+        )
 
     biom_fp = export_dir / "feature-table.biom"
     if biom_fp.exists():
-        run_cmd(cmd=[
-            "biom","summarize-table",
-            "-i", str(biom_fp),
-            "-o", str(out_qc / "sample_depths.txt"),
-        ], log_file=logs / "qc_biom_summarize.log", logger=logger)
+        run_cmd(
+            cmd=[
+                "biom", "summarize-table",
+                "-i", str(biom_fp),
+                "-o", str(out_qc / "sample_depths.txt"),
+            ],
+            log_file=logs / "qc_biom_summarize.log",
+            logger=logger,
+        )
 
-    # 6b) ASV lengths: export rep-seqs fasta, compute lengths
+    # 6b) ASV lengths: export rep-seqs FASTA, compute lengths
     rep_export = out_qc / "export_repseqs"
-    rep_export.mkdir(exist_ok=True)
-    run_cmd(cmd=[
-        "qiime","tools","export",
-        "--input-path", str(repseqs_qza),
-        "--output-path", str(rep_export),
-    ], log_file=logs / "qc_export_repseqs.log", logger=logger)
+    rep_export.mkdir(parents=True, exist_ok=True)
+
+    if repseqs_qza.exists():
+        run_cmd(
+            cmd=[
+                "qiime", "tools", "export",
+                "--input-path", str(repseqs_qza),
+                "--output-path", str(rep_export),
+            ],
+            log_file=logs / "qc_export_repseqs.log",
+            logger=logger,
+        )
 
     fasta = rep_export / "dna-sequences.fasta"
     if fasta.exists():
-        # Write a tiny TSV: FeatureID\tLength
         tsv = out_qc / "asv_lengths.tsv"
-        # do it in python quickly (no external awk dependency)
         try:
-            import gzip
-            L = {}
-            cur = None
-            with open(fasta, "r", encoding="utf-8", errors="replace") as fh:
-                for line in fh:
-                    if line.startswith(">"):
-                        cur = line.strip()[1:]
-                        L[cur] = 0
-                    else:
-                        if cur is not None:
-                            L[cur] += len(line.strip())
-            with open(tsv, "w", encoding="utf-8") as out:
-                out.write("FeatureID\tLength\n")
-                for k,v in L.items():
-                    out.write(f"{k}\t{v}\n")
-        except Exception as e:
-            if logger: logger.warning("ASV length TSV failed: %s", e)
+            lengths: Dict[str, int] = {}
+            seq_id: Optional[str] = None
+            seq_buf: list[str] = []
 
-    # 6c) tiny overall counts file
+            with fasta.open("r", encoding="utf-8", errors="replace") as fh:
+                for line in fh:
+                    line = line.rstrip("\n\r")
+                    if line.startswith(">"):
+                        if seq_id is not None:
+                            lengths[seq_id] = sum(len(x) for x in seq_buf)
+                        seq_id = line[1:].split()[0]
+                        seq_buf = []
+                    else:
+                        seq_buf.append(line)
+                if seq_id is not None:
+                    lengths[seq_id] = sum(len(x) for x in seq_buf)
+
+            with tsv.open("w", encoding="utf-8") as out:
+                out.write("FeatureID\tLength\n")
+                for k, v in lengths.items():
+                    out.write(f"{k}\t{v}\n")
+        except Exception as err:  # noqa: BLE001
+            if logger:
+                logger.warning("ASV length TSV failed: %s", err)
+
+    # 6c) tiny overall counts file (parsed from BIOM summary)
     counts_tsv = out_qc / "counts_summary.tsv"
     try:
-        # quick import via qiime2R is overkill here; rely on BIOM summary + counts
-        with open(out_qc / "sample_depths.txt", "r", encoding="utf-8", errors="ignore") as fh:
-            lines = fh.read()
-        # parse totals
-        import re
-        m = re.search(r"Number of samples:\s+(\d+)", lines)
-        ns = int(m.group(1)) if m else -1
-        m = re.search(r"Number of observations:\s+(\d+)", lines)
-        nt = int(m.group(1)) if m else -1
-        m = re.search(r"Total count:\s+(\d+)", lines)
-        tot = int(m.group(1)) if m else -1
-        with open(counts_tsv, "w") as out:
-            out.write("samples\ttaxa\ttotal_reads\n")
-            out.write(f"{ns}\t{nt}\t{tot}\n")
+        summary_txt = out_qc / "sample_depths.txt"
+        if summary_txt.exists():
+            text = summary_txt.read_text(encoding="utf-8", errors="ignore")
+            m = re.search(r"Number of samples:\s+(\d+)", text)
+            n_samples = int(m.group(1)) if m else -1
+            m = re.search(r"Number of observations:\s+(\d+)", text)
+            n_taxa = int(m.group(1)) if m else -1
+            m = re.search(r"Total count:\s+(\d+)", text)
+            total = int(m.group(1)) if m else -1
+
+            with counts_tsv.open("w", encoding="utf-8") as out:
+                out.write("samples\ttaxa\ttotal_reads\n")
+                out.write(f"{n_samples}\t{n_taxa}\t{total}\n")
     except Exception:
+        # Best-effort only; fine to skip on failure.
         pass
 
 
+
+def _deduplicate_tsv_headers(in_path: Path, out_path: Path) -> Path:
+    """Rewrite a TSV so its header names are unique (A, A.2, A.3, ...)."""
+    with in_path.open("r", encoding="utf-8", errors="replace", newline="") as f:
+        rows = list(csv.reader(f, delimiter="\t"))
+    if not rows:
+        raise ValueError(f"Empty TSV: {in_path}")
+    header, body = rows[0], rows[1:]
+    seen = {}
+    new_header = []
+    for h in header:
+        count = seen.get(h, 0) + 1
+        seen[h] = count
+        new_header.append(h if count == 1 else f"{h}.{count}")
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    with out_path.open("w", encoding="utf-8", newline="") as f:
+        w = csv.writer(f, delimiter="\t")
+        w.writerow(new_header)
+        w.writerows(body)
+    return out_path
 
 def ensure_legacy_metadata_location(
     *,
