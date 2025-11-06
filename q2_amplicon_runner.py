@@ -39,6 +39,7 @@ from tempfile import NamedTemporaryFile
 import stat
 import os
 import logging
+import csv
 import time
 try:
     import psutil
