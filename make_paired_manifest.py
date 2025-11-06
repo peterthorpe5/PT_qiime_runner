@@ -36,6 +36,9 @@ from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple
 
 
+print("[DEBUG] make_paired_manifest.py loaded – boundary-aware matcher active", flush=True)
+
+
 def normalise_sample_id(text: str) -> str:
     """Return a normalised sample identifier safe for filenames and downstream tools.
 
@@ -359,6 +362,17 @@ def build_rows_mode_b(
     - Enforce a boundary after the prefix to avoid 'Ema.1' matching 'Ema_10...'.
     - Emit all R1/R2 pairs for any matched stems (multi-lane friendly).
     """
+    print(f"[DEBUG] build_rows_mode_b: {len(sample_ids)} sample IDs from metadata", flush=True)
+    print(f"[DEBUG] build_rows_mode_b: {len(groups)} FASTQ stems detected", flush=True)
+
+    for sid in sample_ids[:10]:  # show first 10 only
+        matched = [(stem, rr) for stem, rr in groups.items() if _prefix_boundary_match(stem, sid)]
+        if matched:
+            print(f"[DEBUG] {sid}: matched {len(matched)} stems (e.g. {list(dict(matched).keys())[:3]})", flush=True)
+        else:
+            print(f"[DEBUG] {sid}: no matches", flush=True)
+
+
     rows: list[tuple[str, Path, Path]] = []
     missing: list[str] = []
 
