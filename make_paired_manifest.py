@@ -66,25 +66,30 @@ def read_metadata(
     sample_id_column: str,
     filename_key_column: Optional[str],
 ) -> Tuple[Optional[Dict[str, str]], Optional[List[str]]]:
-    """Read metadata and return mappings for Mode A or a sample-id list for Mode B.
+    """
+    Read the metadata TSV and return either a filename-key → sample-id map
+    (Mode A) or an ordered list of sample-ids (Mode B).
 
-    If ``filename_key_column`` is provided (Mode A), a mapping from that column
-    to normalised sample IDs is returned. Otherwise (Mode B), a list of normalised
-    sample IDs is returned.
+    Behaviour:
+    - Sample IDs are preserved exactly as in the metadata (whitespace trimmed).
+      No underscore/dot normalisation is applied here so the manifest's
+      'sample-id' column matches the metadata verbatim.
+    - In Mode A, the filename-key column is also taken verbatim (trimmed).
+    - Empty values are skipped; duplicates raise ValueError.
 
     Args:
-        metadata_tsv: Path to the QIIME-style metadata TSV.
-        sample_id_column: Column providing the desired final 'sample-id' values.
-        filename_key_column: Column expected to occur in filenames (e.g. 'DNA.code').
-            If ``None``, mapping-by-key is disabled and Mode B is selected.
+        metadata_tsv: Path to a QIIME-style metadata TSV (tab-delimited).
+        sample_id_column: Column whose values should become manifest 'sample-id'.
+        filename_key_column: Column expected to occur in filenames (Mode A).
+                             If None, Mode B is selected.
 
     Returns:
-        A tuple ``(key_to_sample, sample_ids)`` where exactly one is not ``None``:
-        - ``key_to_sample``: dict mapping filename key -> normalised sample-id (Mode A).
-        - ``sample_ids``: list of normalised sample-ids from metadata (Mode B).
+        A tuple (key_to_sample, sample_ids) where exactly one element is not None:
+          - key_to_sample: dict mapping filename key -> exact sample-id (Mode A).
+          - sample_ids: list of exact sample-ids in file order (Mode B).
 
     Raises:
-        ValueError: If required columns are missing or duplicates are detected.
+        ValueError: On missing columns or duplicate values.
     """
     with metadata_tsv.open("r", encoding="utf-8") as fh:
         reader = csv.DictReader(fh, delimiter="\t")
@@ -95,17 +100,20 @@ def read_metadata(
                 f"Columns present: {', '.join(cols)}"
             )
 
+        # ---------------------- Mode A: mapping by key ---------------------- #
         if filename_key_column:
             if filename_key_column not in cols:
                 raise ValueError(
                     f"Column '{filename_key_column}' not found in metadata. "
                     f"Columns present: {', '.join(cols)}"
                 )
+
             key_to_sample: Dict[str, str] = {}
             seen_samples: set[str] = set()
             seen_keys: set[str] = set()
+
             for row in reader:
-                sample = normalise_sample_id(row.get(sample_id_column, ""))
+                sample = (row.get(sample_id_column, "") or "").strip()
                 key = (row.get(filename_key_column, "") or "").strip()
                 if not sample or not key:
                     continue
@@ -119,19 +127,25 @@ def read_metadata(
                 seen_samples.add(sample)
                 seen_keys.add(key)
                 key_to_sample[key] = sample
+
             return key_to_sample, None
 
+        # ---------------------- Mode B: sample list only -------------------- #
         sample_ids: List[str] = []
-        seen_samples = set()
+        seen_samples: set[str] = set()
+
         for row in reader:
-            sample = normalise_sample_id(row.get(sample_id_column, ""))
+            sample = (row.get(sample_id_column, "") or "").strip()
             if not sample:
                 continue
             if sample in seen_samples:
                 raise ValueError(f"Duplicate sample-id in metadata: '{sample}'")
             seen_samples.add(sample)
             sample_ids.append(sample)
+
         return None, sample_ids
+
+
 
 
 def find_fastqs(

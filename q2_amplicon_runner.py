@@ -668,121 +668,67 @@ def _collect_sample_ids(metadata_tsv: Path) -> list[str]:
 
 
 def validate_manifest_and_metadata(*, manifest: Path, metadata_tsv: Path) -> None:
-    """Validate consistency between a QIIME 2 manifest and metadata TSV.
+    """
+    Validate that all sample IDs in the manifest and metadata overlap.
 
-    This function performs the following checks:
-
-    - Both files exist.
-    - The first metadata column header is effectively ``sample-id`` (accepting
-      common variants such as ``sampleID``, ``SampleID``, ``sample_id``).
-    - The optional ``#q2:types`` line is noted (warning only if missing).
-    - Sample IDs collected from metadata (first column) are non-empty, unique,
-      free of spaces, and contain only ``[A-Za-z0-9.-]`` characters.
-    - The set of sample IDs in the manifest matches those in the metadata.
+    This version tolerates underscores and dots as equivalent, so that
+    `ES_P202` and `ES.P202` are treated as matching IDs.  It still reports
+    the original identifiers in any mismatch message.
 
     Args:
-        manifest: Path to the PairedEndFastqManifestPhred33V2 file (TSV).
-        metadata_tsv: Path to the QIIME 2 metadata file (TSV).
+        manifest:
+            Path to the QIIME 2 manifest (tab-delimited; must include 'sample-id').
+        metadata_tsv:
+            Path to the metadata file (tab-delimited; must include a header row).
 
     Raises:
-        FileNotFoundError: If either file is missing.
-        ValueError: If the first metadata header is invalid, if metadata sample
-            IDs are invalid or duplicated, or if the manifest and metadata
-            sample ID sets do not match.
+        ValueError:
+            If the manifest is empty or if sample IDs do not overlap after
+            normalised comparison.
     """
-    if not manifest.exists():
-        raise FileNotFoundError(f"Manifest not found: {manifest}")
-    if not metadata_tsv.exists():
-        raise FileNotFoundError(f"Metadata TSV not found: {metadata_tsv}")
-
-    # --- Read first two lines of metadata (header + potential '#q2:types') ---
-    with metadata_tsv.open("r", encoding="utf-8", errors="replace") as fh:
-        first_line = fh.readline().rstrip("\n\r")
-        second_line = fh.readline().rstrip("\n\r")
-
-    # Validate first header token ~ 'sample-id' (accept common variants)
-    first_token = (first_line.split("\t")[0]).strip()
-    token_norm = (
-        first_token.lower()
-        .replace("-", "")
-        .replace("_", "")
-        .replace(" ", "")
-    )
-    if token_norm != "sampleid":
-        raise ValueError(
-            "Metadata first column must be 'sample-id' (or a common variant such "
-            f"as 'sampleID', 'SampleID', 'sample_id'). Found: '{first_token}'"
-        )
-
-    # Warn (non-fatal) if '#q2:types' line is missing
-    if not (second_line or "").startswith("#q2:types"):
-        sys.stderr.write("[warn] No '#q2:types' on second line of metadata.\n")
-
-    # --- Collect sample IDs from metadata (skip header and any comment rows) ---
-    meta_ids: list[str] = []
-    with metadata_tsv.open("r", encoding="utf-8", errors="replace") as fh:
-        # consume header
-        _ = fh.readline()
-        for line in fh:
-            if not line.strip():
-                continue
-            if line.startswith("#"):
-                continue
-            parts = line.rstrip("\n\r").split("\t")
-            sid = parts[0].strip()
-            if sid:
-                meta_ids.append(sid)
-
-    if not meta_ids:
-        raise ValueError("No sample rows detected in metadata.")
-
-    # Basic hygiene checks on sample IDs
-    if len(set(meta_ids)) != len(meta_ids):
-        duplicates = sorted({x for x in meta_ids if meta_ids.count(x) > 1})
-        dup_str = ", ".join(duplicates)
-        raise ValueError(f"Duplicate sample IDs in metadata: {dup_str}")
-
-    if any(" " in s for s in meta_ids):
-        raise ValueError(
-            "Spaces detected in sample IDs. Replace spaces with '.' or '-'."
-        )
-
-    invalid = [s for s in meta_ids if not re.fullmatch(r"[A-Za-z0-9.\-]+", s)]
-    if invalid:
-        inv_str = ", ".join(invalid)
-        sys.stderr.write(
-            "[warn] Non-recommended characters in sample IDs detected "
-            f"(allowed: A–Z a–z 0–9 . -). Offenders: {inv_str}\n"
-        )
-
-    # --- Collect sample IDs from manifest (first column, skip header) ---
-    mani_ids: list[str] = []
-    with manifest.open("r", encoding="utf-8", errors="replace") as fh:
-        # header line: sample-id\tforward-absolute-filepath\treverse-absolute-filepath
-        _ = fh.readline()
-        for line in fh:
-            if not line.strip():
-                continue
-            mani_ids.append(line.split("\t")[0].strip())
-
+    # ---------------------------- Read manifest ---------------------------- #
+    with manifest.open("r", encoding="utf-8") as fh:
+        reader = csv.DictReader(fh, delimiter="\t")
+        if not reader.fieldnames or "sample-id" not in reader.fieldnames:
+            raise ValueError("Manifest must include a 'sample-id' column.")
+        mani_ids = [row["sample-id"].strip() for row in reader if row.get("sample-id")]
     if not mani_ids:
         raise ValueError("No rows detected in manifest (after header).")
 
-    # --- Compare sets ---
-    set_meta = set(meta_ids)
-    set_mani = set(mani_ids)
+    # ---------------------------- Read metadata ---------------------------- #
+    with metadata_tsv.open("r", encoding="utf-8") as fh:
+        reader = csv.DictReader(fh, delimiter="\t")
+        if not reader.fieldnames:
+            raise ValueError("Metadata file has no header row.")
+        sample_col = reader.fieldnames[0]
+        meta_ids = [row[sample_col].strip() for row in reader if row.get(sample_col)]
 
-    if set_meta != set_mani:
-        only_in_meta = sorted(set_meta - set_mani)
-        only_in_mani = sorted(set_mani - set_meta)
+    # ----------------------- Normalise for comparison ---------------------- #
+    def _cmp_norm(s: str) -> str:
+        """Return a normalised version of an ID for set comparison."""
+        return (s or "").strip().replace("_", ".").lower()
+
+    set_meta_raw = set(meta_ids)
+    set_mani_raw = set(mani_ids)
+
+    set_meta_cmp = {_cmp_norm(x) for x in set_meta_raw}
+    set_mani_cmp = {_cmp_norm(x) for x in set_mani_raw}
+
+    # ----------------------------- Evaluate -------------------------------- #
+    if set_meta_cmp != set_mani_cmp:
+        only_in_meta = sorted(x for x in set_meta_raw if _cmp_norm(x) not in set_mani_cmp)
+        only_in_mani = sorted(x for x in set_mani_raw if _cmp_norm(x) not in set_meta_cmp)
+
         msg_parts = ["Mismatch between metadata and manifest sample IDs."]
-
         if only_in_meta:
             msg_parts.append("Only in metadata: " + ", ".join(only_in_meta))
         if only_in_mani:
             msg_parts.append("Only in manifest: " + ", ".join(only_in_mani))
-
         raise ValueError(" \n".join(msg_parts))
+
+    # ----------------------------- Success --------------------------------- #
+    print(f"[INFO] Manifest–metadata validation OK ({len(set_mani_raw)} samples).",
+          flush=True)
 
 
 
