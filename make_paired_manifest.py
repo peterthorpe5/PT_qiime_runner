@@ -61,38 +61,6 @@ def normalise_sample_id(text: str) -> str:
     return s
 
 
-def _prefix_boundary_match(stem: str, sid: str) -> bool:
-    """
-    Return True if 'sid' is a prefix of 'stem' with a word-like boundary.
-
-    A boundary is end-of-string or one of [._-] immediately after the prefix.
-    Tries four variants to bridge '.' and '_' differences:
-
-      1) stem startswith sid
-      2) (stem with '_'→'.') startswith sid
-      3) stem startswith (sid with '.'→'_')
-      4) (stem with '_'→'.') startswith (sid with '.'→'_')
-
-    Examples
-    --------
-    Ema.10  ↔  Ema_10_S153    → match
-    ES.B57RepA  ↔  ES_B57RepA_S106 → match
-    Ema.1   ↔  Ema_10_S153    → no match (protected by boundary)
-    """
-    def _match(s: str, prefix: str) -> bool:
-        # anchor at start; require boundary after the prefix
-        pat = r'^' + re.escape(prefix) + r'(?:$|[._-])'
-        return re.match(pat, s) is not None
-
-    sid_dot2us = sid.replace(".", "_")
-    stem_us2dot = stem.replace("_", ".")
-    return (
-        _match(stem, sid)
-        or _match(stem_us2dot, sid)
-        or _match(stem, sid_dot2us)
-        or _match(stem_us2dot, sid_dot2us)
-    )
-
 
 def read_metadata(
     *,
@@ -227,6 +195,54 @@ def _stems_equal_normalised(stem: str, sid: str) -> bool:
     s2 = sid.replace("_", ".")
     return s1 == s2
 
+
+def _stem_core(stem: str) -> str:
+    """Return the stem with any trailing lane token removed.
+
+    Accepts common bcl2fastq-style tokens such as '_S123' (also '-S123' or '.S123').
+
+    Args:
+        stem: Filename stem extracted before the R1/R2 marker.
+
+    Returns:
+        The stem without a trailing lane token.
+    """
+    return re.sub(r'([._-])S\d+$', '', stem)
+
+
+def _id_equivalent(sample_id: str, stem: str) -> bool:
+    """Test strict equivalence between a metadata sample ID and a FASTQ stem.
+
+    Rules
+    -----
+    1) Treat '_' and '.' as interchangeable (equivalence classes).
+    2) Allow *only* a trailing lane token on the stem (e.g., '_S123').
+    3) No prefix matching, no extra suffixes (so 'ENDO.2111' ≠ 'ENDO.2111.bis').
+
+    Args:
+        sample_id: The metadata sample identifier (first column).
+        stem: The filename stem (portion before '_R1'/'_R2').
+
+    Returns:
+        True if they are equivalent under these constraints, else False.
+    """
+    # Generate normalised variants for robust equality checks
+    sid_variants = {
+        sample_id,
+        sample_id.replace('.', '_'),
+        sample_id.replace('_', '.'),
+    }
+    # Stem variants: raw, lane-stripped, and each with dot/underscore folded
+    stem_variants = {
+        stem,
+        _stem_core(stem),
+    }
+    # Fold underscore/dot in the stem as well
+    _stem_us = stem.replace('.', '_')
+    _stem_dot = stem.replace('_', '.')
+    stem_variants.update({_stem_us, _stem_core(_stem_us), _stem_dot, _stem_core(_stem_dot)})
+
+    return any(sid == st for sid in sid_variants for st in stem_variants)
 
 
 def infer_stem(name: str, stem_regex: re.Pattern[str]) -> Optional[str]:
@@ -369,45 +385,35 @@ def build_rows_mode_b(
     """
     Build manifest rows when we have metadata but no explicit filename key.
 
-    Policy (exact-first):
-      1) If an EXACT stem equals the sample-id (after '.'↔'_' normalisation),
-         use ONLY that/those exact stems (multi-lane still supported).
-      2) Otherwise, fall back to prefix+boundary (_prefix_boundary_match).
-         This preserves behaviour for IDs that don't have an exact stem.
+    Logic (Option 1: separate samples, exact-first)
+    ----------------------------------------------
+    - Match each metadata sample ID to FASTQ stems using *strict* equivalence:
+      exact ID after folding '_'↔'.' and after removing only a trailing lane token
+      like '_S123' on the stem.
+    - No prefix or fuzzy behaviour; 'ENDO.2111' does not match 'ENDO.2111.bis'.
+    - Emit all R1/R2 pairs per matched stem (multi-lane friendly if present).
     """
     print(f"[DEBUG] build_rows_mode_b: {len(sample_ids)} sample IDs from metadata", flush=True)
     print(f"[DEBUG] build_rows_mode_b: {len(groups)} FASTQ stems detected", flush=True)
 
-    # small preview
+    # Quick visibility for the first few IDs
     for sid in sample_ids[:10]:
-        exact = [stem for stem in groups if _stems_equal_normalised(stem, sid)]
-        if exact:
-            print(f"[DEBUG] {sid}: EXACT match → {exact[:3]}", flush=True)
+        hits = [s for s in groups if _id_equivalent(sid, s)]
+        if hits:
+            print(f"[DEBUG] {sid}: exact-equivalent stems={len(hits)} (e.g. {hits[:3]})", flush=True)
         else:
-            matched = [stem for stem in groups if _prefix_boundary_match(stem, sid)]
-            print(f"[DEBUG] {sid}: prefix/boundary matches={len(matched)} (e.g. {matched[:3]})", flush=True)
+            print(f"[DEBUG] {sid}: no exact-equivalent stems", flush=True)
 
     rows: list[tuple[str, Path, Path]] = []
     missing: list[str] = []
 
     for sid in sample_ids:
-        # Step 1: exact (bridging '.'↔'_')
-        exact_pairs = [(stem, rr) for stem, rr in groups.items()
-                       if _stems_equal_normalised(stem, sid)]
-
-        if exact_pairs:
-            use_pairs = exact_pairs
-            # If exact exists, ignore broader prefix matches to keep samples separate
-        else:
-            # Step 2: prefix + boundary fallback
-            use_pairs = [(stem, rr) for stem, rr in groups.items()
-                         if _prefix_boundary_match(stem, sid)]
-
-        if not use_pairs:
+        matches = [(stem, rr) for stem, rr in groups.items() if _id_equivalent(sid, stem)]
+        if not matches:
             missing.append(sid)
             continue
 
-        for _, rr in use_pairs:
+        for _, rr in matches:
             r1s = sorted(rr["R1"])
             r2s = sorted(rr["R2"])
             n = min(len(r1s), len(r2s))
@@ -421,7 +427,7 @@ def build_rows_mode_b(
 
     if missing:
         raise RuntimeError(
-            "Samples from metadata not found as stems in filenames:\n  - "
+            "Samples from metadata not found as exact-equivalent stems:\n  - "
             + "\n  - ".join(missing)
         )
     return rows
