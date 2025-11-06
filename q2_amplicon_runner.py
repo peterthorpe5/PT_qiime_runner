@@ -285,8 +285,25 @@ def run_cmd(*, cmd: list[str], log_file: Path, logger: Optional[logging.Logger] 
         subprocess.run(cmd, stdout=lf, stderr=lf, check=True)
 
 
+def _min_sample_depth_from_biom_summary(summary_txt: Path) -> Optional[int]:
+    """Parse 'Minimum per-sample count' from BIOM summarize-table output."""
+    if not summary_txt.exists():
+        return None
+    text = summary_txt.read_text(encoding="utf-8", errors="ignore")
+    m = re.search(r"Minimum per-sample count:\s+(\d+)", text)
+    return int(m.group(1)) if m else None
+
+
+from __future__ import annotations
+
+import logging
+import re
+from pathlib import Path
+from typing import Dict, Optional
+
+
 def run_qc_bundle(
-    *, paths: Paths, metadata_tsv: Path, denoiser: str,
+    *, paths: "Paths", metadata_tsv: Path, denoiser: str,
     logger: Optional[logging.Logger] = None
 ) -> None:
     """
@@ -298,19 +315,53 @@ def run_qc_bundle(
     call regardless of which artefacts exist; steps are skipped if inputs are
     missing.
 
-    Created outputs (when inputs are available):
+    New behaviour:
+        - Derives per-sample depths from the exported feature table and saves
+          ``sample-frequency.tsv`` (SampleID → Frequency).
+        - Chooses an automatic rarefaction max depth as the 15th percentile of
+          per-sample depths (retain ≥ 85% of samples), capped at 10,000 and
+          with a minimum of 10. Writes a short explanation to
+          ``depth_recommendation.txt`` and uses this value for
+          ``alpha-rarefaction``.
+        - Adds ``asv_length_summary.tsv`` (min/median/mean/max/N) alongside
+          ``asv_lengths.tsv``.
+        - Expands ``counts_summary.tsv`` to include min/median/max depth,
+          the chosen auto max depth, and estimated retained percentage.
+
+    Created outputs (when inputs are available)
+    -------------------------------------------
       - feature-table_summarize.qzv
       - tabulate-seqs.qzv
       - dada2_stats.qzv (if denoiser == "dada2_paired")
       - deblur_stats.qzv (if denoiser == "deblur_single")
       - taxa-barplot.qzv (if taxonomy present)
-      - alpha-rarefaction.qzv (if rooted tree present; max depth = 10,000)
-      - sample_depths.txt  (BIOM per-sample depth summary)
-      - asv_lengths.tsv    (FeatureID → ASV length, from rep-seqs FASTA)
+      - alpha-rarefaction.qzv (if rooted tree present; auto max depth)
+      - sample_depths.txt      (BIOM per-sample depth summary)
+      - sample-frequency.tsv   (SampleID → Frequency, derived)
+      - counts_summary.tsv     (overall counts + depth stats)
+      - asv_lengths.tsv        (FeatureID → ASV length, from rep-seqs FASTA)
+      - asv_length_summary.tsv (summary of ASV lengths)
       - export_table/, export_repseqs/ (raw exports used by summaries)
+
+    Parameters
+    ----------
+    paths : Paths
+        A container with standardised output/input directories:
+        ``paths.root``, ``paths.qza``, ``paths.qzv``, ``paths.logs``,
+        ``paths.taxonomy``, ``paths.phylogeny``.
+    metadata_tsv : pathlib.Path
+        Path to the sample metadata table (TSV).
+    denoiser : str
+        Either ``"dada2_paired"`` or ``"deblur_single"``; used to choose
+        which stats visualisation to render if present.
+    logger : logging.Logger, optional
+        Logger for progress and warnings.
+
+    Returns
+    -------
+    None
     """
     qza_dir = paths.qza
-    qzv_dir = paths.qzv
     logs = paths.logs
 
     out_qc = paths.root / "qc"
@@ -321,16 +372,14 @@ def run_qc_bundle(
     rep_filtered = qza_dir / "rep-seqs.lengthfilter.qza"
 
     table_qza = table_filtered if table_filtered.exists() else qza_dir / "table.qza"
-    repseqs_qza = (
-        rep_filtered if rep_filtered.exists() else qza_dir / "rep-seqs.qza"
-    )
+    repseqs_qza = rep_filtered if rep_filtered.exists() else qza_dir / "rep-seqs.qza"
 
     rooted_tree_qza = paths.phylogeny / "rooted-tree.qza"
-    stats_qza = qza_dir / "denoise-stats.qza"          # DADA2
-    deblur_stats_qza = qza_dir / "deblur_stats.qza"    # Deblur (if present)
+    stats_qza = qza_dir / "denoise-stats.qza"        # DADA2
+    deblur_stats_qza = qza_dir / "deblur_stats.qza"  # Deblur (if present)
     taxonomy_qza = paths.taxonomy / "taxonomy.qza"
 
-    # 1) Feature-table summarize (+ metadata so sample groups show)
+    # 1) Feature-table summarise (+ metadata so sample groups show)
     if table_qza.exists():
         run_cmd(
             cmd=[
@@ -391,25 +440,15 @@ def run_qc_bundle(
             logger=logger,
         )
 
-    # 5) Alpha-rarefaction (requires tree + table)
-    if rooted_tree_qza.exists() and table_qza.exists():
-        run_cmd(
-            cmd=[
-                "qiime", "diversity", "alpha-rarefaction",
-                "--i-table", str(table_qza),
-                "--i-phylogeny", str(rooted_tree_qza),
-                "--m-metadata-file", str(metadata_tsv),
-                "--p-max-depth", "10000",
-                "--o-visualization", str(out_qc / "alpha-rarefaction.qzv"),
-            ],
-            log_file=logs / "qc_alpha_rarefaction.log",
-            logger=logger,
-        )
-
-    # 6) Plain-text quick summaries
-    # 6a) per-sample depths via BIOM
+    # 5) Plain-text quick summaries + per-sample frequencies
     export_dir = out_qc / "export_table"
     export_dir.mkdir(parents=True, exist_ok=True)
+
+    biom_fp = export_dir / "feature-table.biom"
+    table_tsv = export_dir / "feature-table.tsv"
+    depth_txt = out_qc / "sample_depths.txt"
+    freq_tsv = out_qc / "sample-frequency.tsv"
+    depth_note = out_qc / "depth_recommendation.txt"
 
     if table_qza.exists():
         run_cmd(
@@ -422,19 +461,62 @@ def run_qc_bundle(
             logger=logger,
         )
 
-    biom_fp = export_dir / "feature-table.biom"
+    # BIOM summary (overall counts) and TSV conversion for deterministic parsing.
     if biom_fp.exists():
         run_cmd(
             cmd=[
                 "biom", "summarize-table",
                 "-i", str(biom_fp),
-                "-o", str(out_qc / "sample_depths.txt"),
+                "-o", str(depth_txt),
             ],
             log_file=logs / "qc_biom_summarize.log",
             logger=logger,
         )
+        run_cmd(
+            cmd=[
+                "biom", "convert",
+                "--input-fp", str(biom_fp),
+                "--output-fp", str(table_tsv),
+                "--to-tsv",
+            ],
+            log_file=logs / "qc_biom_convert_tsv.log",
+            logger=logger,
+        )
 
-    # 6b) ASV lengths: export rep-seqs FASTA, compute lengths
+    # Parse TSV matrix → per-sample depths and write sample-frequency.tsv
+    sample_freqs: Dict[str, int] = {}
+    try:
+        if table_tsv.exists():
+            with table_tsv.open("r", encoding="utf-8", errors="replace") as fh:
+                header: Optional[list[str]] = None
+                for line in fh:
+                    if line.startswith("#") and "OTU ID" in line:
+                        # Header line: "#OTU ID\tS1\tS2\t..."
+                        header = line.strip().lstrip("#").split("\t")
+                        sample_freqs = {sid: 0 for sid in header[1:]}
+                        continue
+                    if line.startswith("#") or not line.strip():
+                        continue
+                    if header is None:
+                        continue
+                    fields = line.rstrip("\n\r").split("\t")
+                    values = fields[1:]
+                    for sid, val in zip(header[1:], values):
+                        try:
+                            sample_freqs[sid] += int(float(val))
+                        except Exception:  # noqa: BLE001
+                            # Treat non-numeric as zero
+                            pass
+            with freq_tsv.open("w", encoding="utf-8") as out:
+                out.write("sample-id\tfrequency\n")
+                for sid, freq in sample_freqs.items():
+                    out.write(f"{sid}\t{freq}\n")
+    except Exception as err:  # noqa: BLE001
+        if logger:
+            logger.warning("Failed to compute per-sample frequencies: %s", err)
+        sample_freqs = {}
+
+    # 6) Export rep-seqs FASTA → ASV lengths and summary
     rep_export = out_qc / "export_repseqs"
     rep_export.mkdir(parents=True, exist_ok=True)
 
@@ -452,6 +534,7 @@ def run_qc_bundle(
     fasta = rep_export / "dna-sequences.fasta"
     if fasta.exists():
         tsv = out_qc / "asv_lengths.tsv"
+        tsv_summary = out_qc / "asv_length_summary.tsv"
         try:
             lengths: Dict[str, int] = {}
             seq_id: Optional[str] = None
@@ -470,33 +553,134 @@ def run_qc_bundle(
                 if seq_id is not None:
                     lengths[seq_id] = sum(len(x) for x in seq_buf)
 
+            # Per-ASV lengths
             with tsv.open("w", encoding="utf-8") as out:
                 out.write("FeatureID\tLength\n")
                 for k, v in lengths.items():
                     out.write(f"{k}\t{v}\n")
+
+            # Tiny summary (min/median/mean/max/N)
+            if lengths:
+                vals = sorted(lengths.values())
+                n = len(vals)
+                if n % 2 == 1:
+                    median = vals[n // 2]
+                else:
+                    median = int((vals[n // 2 - 1] + vals[n // 2]) / 2)
+                mean = int(round(sum(vals) / n))
+                with tsv_summary.open("w", encoding="utf-8") as out:
+                    out.write("n\tmin\tmedian\tmean\tmax\n")
+                    out.write(f"{n}\t{min(vals)}\t{median}\t{mean}\t{max(vals)}\n")
         except Exception as err:  # noqa: BLE001
             if logger:
-                logger.warning("ASV length TSV failed: %s", err)
+                logger.warning("ASV length TSVs failed: %s", err)
 
-    # 6c) tiny overall counts file (parsed from BIOM summary)
+    # 7) Tiny overall counts file using computed per-sample depths (preferred)
     counts_tsv = out_qc / "counts_summary.tsv"
+    auto_max_depth = 10_000
     try:
-        summary_txt = out_qc / "sample_depths.txt"
-        if summary_txt.exists():
-            text = summary_txt.read_text(encoding="utf-8", errors="ignore")
-            m = re.search(r"Number of samples:\s+(\d+)", text)
-            n_samples = int(m.group(1)) if m else -1
-            m = re.search(r"Number of observations:\s+(\d+)", text)
-            n_taxa = int(m.group(1)) if m else -1
-            m = re.search(r"Total count:\s+(\d+)", text)
-            total = int(m.group(1)) if m else -1
+        # Auto-select rarefaction depth from per-sample frequencies.
+        if sample_freqs:
+            depths = sorted(sample_freqs.values())
+            n = len(depths)
+            idx = max(0, min(n - 1, int(n * 0.15)))  # 15th percentile
+            candidate = depths[idx]
+            candidate = max(10, min(10_000, int(candidate)))
+            auto_max_depth = candidate
 
-            with counts_tsv.open("w", encoding="utf-8") as out:
-                out.write("samples\ttaxa\ttotal_reads\n")
-                out.write(f"{n_samples}\t{n_taxa}\t{total}\n")
-    except Exception:
-        # Best-effort only; fine to skip on failure.
-        pass
+        # Write a note describing the decision.
+        with (out_qc / "depth_recommendation.txt").open("w", encoding="utf-8") as out:
+            if sample_freqs:
+                out.write(
+                    "Auto rarefaction depth selection\n"
+                    f"- Samples: {len(sample_freqs)}\n"
+                    "- Strategy: 15th percentile of per-sample depths (retain ≥ 85%)\n"
+                    f"- Chosen max depth: {auto_max_depth}\n"
+                    "- Caps: min=10, max=10,000\n"
+                )
+            else:
+                out.write(
+                    "Auto rarefaction depth selection\n"
+                    "- Could not derive per-sample depths; using fallback 10,000.\n"
+                )
+    except Exception as err:  # noqa: BLE001
+        if logger:
+            logger.warning("Auto depth selection failed, using 10,000: %s", err)
+        auto_max_depth = 10_000
+
+    try:
+        # Fill counts summary using derived depths; fallback to BIOM summary.
+        n_samples = -1
+        n_taxa = -1
+        total_reads = -1
+        min_depth = -1
+        median_depth = -1
+        max_depth = -1
+        retained_pc = -1
+
+        if sample_freqs:
+            depths = sorted(sample_freqs.values())
+            n_samples = len(depths)
+            total_reads = sum(depths)
+            min_depth = depths[0]
+            max_depth = depths[-1]
+            if n_samples % 2 == 1:
+                median_depth = depths[n_samples // 2]
+            else:
+                median_depth = int((depths[n_samples // 2 - 1] + depths[n_samples // 2]) / 2)
+
+            # Try to extract taxa count from BIOM summary (if available).
+            if depth_txt.exists():
+                text = depth_txt.read_text(encoding="utf-8", errors="ignore")
+                m = re.search(r"Number of observations:\s+(\d+)", text)
+                n_taxa = int(m.group(1)) if m else -1
+
+            # Estimated retention at chosen depth.
+            try:
+                retained = sum(1 for d in depths if d >= auto_max_depth)
+                retained_pc = int(round(100 * retained / n_samples)) if n_samples > 0 else -1
+            except Exception:  # noqa: BLE001
+                retained_pc = -1
+
+        else:
+            # Fallback entirely to BIOM summary if present.
+            if depth_txt.exists():
+                text = depth_txt.read_text(encoding="utf-8", errors="ignore")
+                m = re.search(r"Number of samples:\s+(\d+)", text)
+                n_samples = int(m.group(1)) if m else -1
+                m = re.search(r"Number of observations:\s+(\d+)", text)
+                n_taxa = int(m.group(1)) if m else -1
+                m = re.search(r"Total count:\s+(\d+)", text)
+                total_reads = int(m.group(1)) if m else -1
+
+        with counts_tsv.open("w", encoding="utf-8") as out:
+            out.write(
+                "samples\ttaxa\ttotal_reads\tmin_depth\tmedian_depth\tmax_depth\t"
+                "auto_max_depth\test_retained_percent\n"
+            )
+            out.write(
+                f"{n_samples}\t{n_taxa}\t{total_reads}\t{min_depth}\t{median_depth}\t"
+                f"{max_depth}\t{auto_max_depth}\t{retained_pc}\n"
+            )
+    except Exception as err:  # noqa: BLE001
+        if logger:
+            logger.warning("Counts summary failed: %s", err)
+
+    # 8) Alpha-rarefaction (requires tree + table) with auto max depth
+    if rooted_tree_qza.exists() and table_qza.exists():
+        run_cmd(
+            cmd=[
+                "qiime", "diversity", "alpha-rarefaction",
+                "--i-table", str(table_qza),
+                "--i-phylogeny", str(rooted_tree_qza),
+                "--m-metadata-file", str(metadata_tsv),
+                "--p-max-depth", str(auto_max_depth),
+                "--o-visualization", str(out_qc / "alpha-rarefaction.qzv"),
+            ],
+            log_file=logs / "qc_alpha_rarefaction.log",
+            logger=logger,
+        )
+
 
 
 
