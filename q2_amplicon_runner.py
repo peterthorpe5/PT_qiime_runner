@@ -294,14 +294,6 @@ def _min_sample_depth_from_biom_summary(summary_txt: Path) -> Optional[int]:
     return int(m.group(1)) if m else None
 
 
-from __future__ import annotations
-
-import logging
-import re
-from pathlib import Path
-from typing import Dict, Optional
-
-
 def run_qc_bundle(
     *, paths: "Paths", metadata_tsv: Path, denoiser: str,
     logger: Optional[logging.Logger] = None
