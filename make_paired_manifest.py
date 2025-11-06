@@ -215,6 +215,20 @@ def split_r1_r2(
     return r1, r2
 
 
+def _stems_equal_normalised(stem: str, sid: str) -> bool:
+    """Return True if `stem` is exactly the same as `sid` after normalising
+    dot/underscore differences.
+
+    Normalisation:
+      - stem '.' and '_' are treated as equivalent
+      - sid '.' and '_' are treated as equivalent
+    """
+    s1 = stem.replace("_", ".")
+    s2 = sid.replace("_", ".")
+    return s1 == s2
+
+
+
 def infer_stem(name: str, stem_regex: re.Pattern[str]) -> Optional[str]:
     """Extract the sample stem from a filename using a compiled regex.
 
@@ -355,35 +369,45 @@ def build_rows_mode_b(
     """
     Build manifest rows when we have metadata but no explicit filename key.
 
-    Logic
-    -----
-    - Treat each metadata sample-id as a prefix of the FASTQ stem.
-    - If no direct prefix match, retry with '.' <-> '_' substitutions.
-    - Enforce a boundary after the prefix to avoid 'Ema.1' matching 'Ema_10...'.
-    - Emit all R1/R2 pairs for any matched stems (multi-lane friendly).
+    Policy (exact-first):
+      1) If an EXACT stem equals the sample-id (after '.'↔'_' normalisation),
+         use ONLY that/those exact stems (multi-lane still supported).
+      2) Otherwise, fall back to prefix+boundary (_prefix_boundary_match).
+         This preserves behaviour for IDs that don't have an exact stem.
     """
     print(f"[DEBUG] build_rows_mode_b: {len(sample_ids)} sample IDs from metadata", flush=True)
     print(f"[DEBUG] build_rows_mode_b: {len(groups)} FASTQ stems detected", flush=True)
 
-    for sid in sample_ids[:10]:  # show first 10 only
-        matched = [(stem, rr) for stem, rr in groups.items() if _prefix_boundary_match(stem, sid)]
-        if matched:
-            print(f"[DEBUG] {sid}: matched {len(matched)} stems (e.g. {list(dict(matched).keys())[:3]})", flush=True)
+    # small preview
+    for sid in sample_ids[:10]:
+        exact = [stem for stem in groups if _stems_equal_normalised(stem, sid)]
+        if exact:
+            print(f"[DEBUG] {sid}: EXACT match → {exact[:3]}", flush=True)
         else:
-            print(f"[DEBUG] {sid}: no matches", flush=True)
-
+            matched = [stem for stem in groups if _prefix_boundary_match(stem, sid)]
+            print(f"[DEBUG] {sid}: prefix/boundary matches={len(matched)} (e.g. {matched[:3]})", flush=True)
 
     rows: list[tuple[str, Path, Path]] = []
     missing: list[str] = []
 
     for sid in sample_ids:
-        matches = [(stem, rr) for stem, rr in groups.items()
-                   if _prefix_boundary_match(stem, sid)]
-        if not matches:
+        # Step 1: exact (bridging '.'↔'_')
+        exact_pairs = [(stem, rr) for stem, rr in groups.items()
+                       if _stems_equal_normalised(stem, sid)]
+
+        if exact_pairs:
+            use_pairs = exact_pairs
+            # If exact exists, ignore broader prefix matches to keep samples separate
+        else:
+            # Step 2: prefix + boundary fallback
+            use_pairs = [(stem, rr) for stem, rr in groups.items()
+                         if _prefix_boundary_match(stem, sid)]
+
+        if not use_pairs:
             missing.append(sid)
             continue
 
-        for _, rr in matches:
+        for _, rr in use_pairs:
             r1s = sorted(rr["R1"])
             r2s = sorted(rr["R2"])
             n = min(len(r1s), len(r2s))
