@@ -31,6 +31,7 @@ import csv
 import os
 import re
 import sys
+import re
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple
 
@@ -55,6 +56,39 @@ def normalise_sample_id(text: str) -> str:
     s = re.sub(r"\(([0-9]+)\)", r".\1", s)
     s = re.sub(r"[^A-Za-z0-9.\-]+", ".", s)
     return s
+
+
+def _prefix_boundary_match(stem: str, sid: str) -> bool:
+    """
+    Return True if 'sid' is a prefix of 'stem' with a word-like boundary.
+
+    A boundary is end-of-string or one of [._-] immediately after the prefix.
+    Tries four variants to bridge '.' and '_' differences:
+
+      1) stem startswith sid
+      2) (stem with '_'→'.') startswith sid
+      3) stem startswith (sid with '.'→'_')
+      4) (stem with '_'→'.') startswith (sid with '.'→'_')
+
+    Examples
+    --------
+    Ema.10  ↔  Ema_10_S153    → match
+    ES.B57RepA  ↔  ES_B57RepA_S106 → match
+    Ema.1   ↔  Ema_10_S153    → no match (protected by boundary)
+    """
+    def _match(s: str, prefix: str) -> bool:
+        # anchor at start; require boundary after the prefix
+        pat = r'^' + re.escape(prefix) + r'(?:$|[._-])'
+        return re.match(pat, s) is not None
+
+    sid_dot2us = sid.replace(".", "_")
+    stem_us2dot = stem.replace("_", ".")
+    return (
+        _match(stem, sid)
+        or _match(stem_us2dot, sid)
+        or _match(stem, sid_dot2us)
+        or _match(stem_us2dot, sid_dot2us)
+    )
 
 
 def read_metadata(
@@ -311,31 +345,31 @@ def build_rows_mode_a(
 
 def build_rows_mode_b(
     *,
-    groups: Dict[str, Dict[str, List[Path]]],
-    sample_ids: List[str],
-    symlink_dir: Optional[Path],
-) -> List[Tuple[str, Path, Path]]:
-    """Build manifest rows by assuming stems already start with sample-id (Mode B).
-
-    Args:
-        groups: Mapping of stem to R1/R2 lists.
-        sample_ids: List of normalised sample IDs from metadata.
-        symlink_dir: Directory for tidy symlinks, or ``None`` to disable.
-
-    Returns:
-        A list of ``(sample_id, r1_path, r2_path)`` tuples.
-
-    Raises:
-        RuntimeError: If some metadata sample IDs are not found as stems.
+    groups: dict[str, dict[str, list[Path]]],
+    sample_ids: list[str],
+    symlink_dir: Path | None,
+) -> list[tuple[str, Path, Path]]:
     """
-    rows: List[Tuple[str, Path, Path]] = []
-    missing: List[str] = []
+    Build manifest rows when we have metadata but no explicit filename key.
+
+    Logic
+    -----
+    - Treat each metadata sample-id as a prefix of the FASTQ stem.
+    - If no direct prefix match, retry with '.' <-> '_' substitutions.
+    - Enforce a boundary after the prefix to avoid 'Ema.1' matching 'Ema_10...'.
+    - Emit all R1/R2 pairs for any matched stems (multi-lane friendly).
+    """
+    rows: list[tuple[str, Path, Path]] = []
+    missing: list[str] = []
+
     for sid in sample_ids:
-        matched = [(stem, rr) for stem, rr in groups.items() if stem.startswith(sid)]
-        if not matched:
+        matches = [(stem, rr) for stem, rr in groups.items()
+                   if _prefix_boundary_match(stem, sid)]
+        if not matches:
             missing.append(sid)
             continue
-        for _, rr in matched:
+
+        for _, rr in matches:
             r1s = sorted(rr["R1"])
             r2s = sorted(rr["R2"])
             n = min(len(r1s), len(r2s))
@@ -346,11 +380,14 @@ def build_rows_mode_b(
                     suffix = "" if n == 1 else f"_L{i+1:03d}"
                     safe_symlink(r1, symlink_dir / f"{sid}_R1{suffix}.fastq.gz")
                     safe_symlink(r2, symlink_dir / f"{sid}_R2{suffix}.fastq.gz")
+
     if missing:
         raise RuntimeError(
-            "Samples from metadata not found as stems in filenames:\n  - " + "\n  - ".join(missing)
+            "Samples from metadata not found as stems in filenames:\n  - "
+            + "\n  - ".join(missing)
         )
     return rows
+
 
 
 def build_rows_mode_c(
