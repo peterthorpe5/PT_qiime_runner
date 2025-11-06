@@ -36,8 +36,6 @@ from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple
 
 
-print("[DEBUG] make_paired_manifest.py loaded – boundary-aware matcher active", flush=True)
-
 
 def normalise_sample_id(text: str) -> str:
     """Return a normalised sample identifier safe for filenames and downstream tools.
