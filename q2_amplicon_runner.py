@@ -41,6 +41,8 @@ import os
 import logging
 import csv
 import time
+import pandas as pd
+from typing import Iterable, Optional, Dict
 try:
     import psutil
 except Exception:
@@ -166,6 +168,143 @@ def setup_logging(*, out_dir: Path, run_label: str) -> logging.Logger:
     logger.debug("Command line: %s", " ".join(sys.argv))
 
     return logger
+
+
+def validate_metadata_content(
+    *,
+    metadata_tsv: Path,
+    min_cols: int = 2,
+) -> None:
+    """
+    Validate that a QIIME-style metadata TSV looks sane.
+
+    Checks:
+      - No obvious non-TSV payloads (e.g., lines starting with a Python shebang).
+      - First row exists and has at least `min_cols` columns.
+      - All non-comment rows have the same number of columns as the header.
+
+    Parameters
+    ----------
+    metadata_tsv : pathlib.Path
+        Candidate metadata TSV.
+    min_cols : int, default 2
+        Minimum number of columns required in the header.
+
+    Raises
+    ------
+    ValueError
+        If any check fails.
+    """
+    if not metadata_tsv.exists():
+        raise ValueError(f"Metadata file not found: {metadata_tsv}")
+
+    with metadata_tsv.open("r", encoding="utf-8", errors="replace") as fh:
+        lines = fh.readlines()
+
+    if not lines:
+        raise ValueError(f"Metadata is empty: {metadata_tsv}")
+
+    header = lines[0].rstrip("\n\r")
+    n_cols = len(header.split("\t")) if header else 0
+    if n_cols < min_cols:
+        raise ValueError(
+            f"Metadata header has too few columns ({n_cols} < {min_cols}) in {metadata_tsv}"
+        )
+
+    # Obvious non-TSV payloads
+    bad_markers = ("#!/usr/bin/env python", "from __future__ import", "import argparse")
+    for i, raw in enumerate(lines[:200], start=1):  # scan first 200 lines
+        if any(raw.startswith(m) for m in bad_markers):
+            raise ValueError(
+                f"Detected non-TSV content at line {i} of {metadata_tsv}: {raw[:60]!r}"
+            )
+
+    # Column count consistency on data lines (skip comments)
+    for i, raw in enumerate(lines[1:], start=2):
+        if not raw.strip() or raw.startswith("#"):
+            continue
+        nf = len(raw.rstrip("\n\r").split("\t"))
+        if nf != n_cols:
+            raise ValueError(
+                f"Column count mismatch at line {i} ({nf} vs header {n_cols}) in {metadata_tsv}"
+            )
+
+
+def make_qiime_metadata_copy(
+    *,
+    src_tsv: Path,
+    out_dir: Path,
+    id_col_candidates: Iterable[str] = ("sample-id", "SampleID", "sampleID", "Sample_ID", "sample_id", "Sample-ID", "Sample ID", "Sample.ID"),
+    force_id_header: str = "sample-id",
+    add_q2_types: bool = False,
+) -> Path:
+    """
+    Write a persistent, normalised metadata TSV for QIIME.
+
+    Normalises the first column name to `force_id_header` and keeps the file
+    on disk for the whole run (no ephemeral NamedTemporaryFile).
+
+    Parameters
+    ----------
+    src_tsv : pathlib.Path
+        Source metadata TSV.
+    out_dir : pathlib.Path
+        Folder to write the normalised copy into.
+    id_col_candidates : Iterable[str], default (...)
+        Acceptable first-column names to treat as the ID column.
+    force_id_header : str, default 'sample-id'
+        Header to use for the first column in the output.
+    add_q2_types : bool, default False
+        If True, add a '#q2:types' second line with 'categorical' for all columns.
+
+    Returns
+    -------
+    pathlib.Path
+        Path to the persistent, QIIME-friendly metadata TSV.
+
+    Raises
+    ------
+    ValueError
+        If the source file fails validation or no ID column is found.
+    """
+    validate_metadata_content(metadata_tsv=src_tsv)
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out_path = out_dir / "metadata.for_qiime.tsv"
+
+    df = pd.read_csv(src_tsv, sep="\t", dtype=str).fillna("")
+
+    # Identify the ID column
+    first_col = df.columns[0]
+    if first_col not in id_col_candidates:
+        raise ValueError(
+            f"First column must be one of {tuple(id_col_candidates)}; found '{first_col}' in {src_tsv}"
+        )
+
+    # Rename and clean ID column
+    if first_col != force_id_header:
+        df = df.rename(columns={first_col: force_id_header})
+    df[force_id_header] = df[force_id_header].astype(str).str.strip()
+
+    # Ensure ID column is first
+    cols = [force_id_header] + [c for c in df.columns if c != force_id_header]
+    df = df[cols]
+
+    if add_q2_types:
+        header = "\t".join(df.columns)
+        types_line = "#q2:types\t" + "\t".join("categorical" for _ in df.columns[1:])
+        with out_path.open("w", encoding="utf-8") as handle:
+            handle.write(header + "\n")
+            handle.write(types_line + "\n")
+        df.to_csv(out_path, sep="\t", index=False, mode="a", encoding="utf-8")
+    else:
+        df.to_csv(out_path, sep="\t", index=False, encoding="utf-8")
+
+    # Re-validate the written copy (defensive)
+    validate_metadata_content(metadata_tsv=out_path)
+    return out_path
+
+
 
 
 def log_section(*, logger: logging.Logger, title: str) -> None:
@@ -1487,6 +1626,22 @@ def main() -> None:
     q2tmp = ensure_qiime2_tmp(tmp_root=tmp)
     logger.info("QIIME2_TMP=%s", q2tmp)
 
+    meta_for_qiime = make_qiime_metadata_copy(
+    src_tsv=args.metadata_tsv,
+    out_dir=paths.root / "tmp",
+    add_q2_types=False,  # set True if you want the types line
+            )
+    # Make legacy path (symlink/copy) point to the canonical copy
+    legacy_meta = ensure_legacy_metadata_location(
+        metadata_src=meta_for_qiime,
+        legacy_relpath=Path("metadata/metadata16S.tsv"),
+        prefer_symlink=True,
+    )
+
+    # Internal validation (manifest/metadata) — validate against the canonical copy
+    validate_manifest_and_metadata(manifest=args.manifest, 
+                                   metadata_tsv=meta_for_qiime)
+
     # loads of faff here tyriing to sort which primers
     # Resolve primer settings
     used_default = False
@@ -1523,11 +1678,6 @@ def main() -> None:
 
     paths = ensure_dirs(out_dir=args.out_dir)
     logger.info("out_dir=%s denoiser=%s", paths.root, args.denoiser)
-
-    # Internal validation (manifest/metadata)
-    fixed_meta = _canonicalise_metadata_first_col(metadata_tsv=args.metadata_tsv, logger=logger)
-    validate_manifest_and_metadata(manifest=args.manifest, metadata_tsv=fixed_meta)
-
 
     # Optional: external checker script (non-interactive)
     checker = shutil.which("check_map.sh")
@@ -1717,7 +1867,7 @@ def main() -> None:
         logger.warning("No classifier provided; skipping taxonomy assignment.")
 
     # 8) Prepare phyloseq_output folder
-    shutil.copy2(fixed_meta, paths.phyloseq_output / "metadata.tsv") 
+    shutil.copy2(meta_for_qiime, paths.phyloseq_output / "metadata.tsv")
     shutil.copy2(table_qza, paths.phyloseq_output / "table.qza")
     shutil.copy2(repseqs_qza, paths.phyloseq_output / "rep-seqs.qza")
     shutil.copy2(rooted, paths.phyloseq_output / "rooted-tree.qza")
@@ -1738,7 +1888,7 @@ def main() -> None:
         },
     )
     # QC bundle (lives in results/<RUN>/qc)
-    run_qc_bundle(paths=paths, metadata_tsv=fixed_meta, denoiser=args.denoiser, logger=logger)
+    run_qc_bundle(paths=paths, metadata_tsv=meta_for_qiime, denoiser=args.denoiser, logger=logger)
     logger.info("QC bundle written to: %s", paths.root / "qc")
     end_ts = time.time()
     logger.info("End time: %s", time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(end_ts)))
