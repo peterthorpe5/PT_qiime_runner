@@ -1711,13 +1711,6 @@ def main() -> None:
 
 
 
-    # Make legacy metadata path available for any hard-coded consumers
-    legacy_meta = ensure_legacy_metadata_location(
-        metadata_src=args.metadata_tsv,
-        legacy_relpath=Path("metadata/metadata16S.tsv"),
-        prefer_symlink=True,
-    )
-
     paths = ensure_dirs(out_dir=args.out_dir)
     logger.info("out_dir=%s denoiser=%s", paths.root, args.denoiser)
 
