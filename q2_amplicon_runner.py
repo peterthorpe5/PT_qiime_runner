@@ -798,19 +798,61 @@ def run_qc_bundle(
             logger.warning("Counts summary failed: %s", err)
 
     # 8) Alpha-rarefaction (requires tree + table) with auto max depth
-    if rooted_tree_qza.exists() and table_qza.exists():
-        run_cmd(
-            cmd=[
+    # --- Compute min_depth and a safe steps value ---
+    # Derive min_depth from per-sample frequencies if available; else default to 1
+    if sample_freqs:
+        depths_sorted = sorted(sample_freqs.values())
+        min_depth_observed = max(1, depths_sorted[0])
+    else:
+        min_depth_observed = 1
+
+    # If auto_max_depth would be below min_depth, bump it up to min_depth
+    if auto_max_depth < min_depth_observed:
+        auto_max_depth = min_depth_observed
+        if logger:
+            logger.warning("Adjusted max depth to %d to be ≥ min depth.", auto_max_depth)
+
+    # Steps cannot exceed the number of integer depths in [min_depth, max_depth]
+    steps_possible = max(1, auto_max_depth - min_depth_observed + 1)
+    steps_safe = min(10, steps_possible)  # 10 is the q2 default; clamp if needed
+
+    # Optionally skip if the window is degenerate
+    if steps_safe < 1 or auto_max_depth < 1:
+        if logger:
+            logger.warning("Skipping alpha-rarefaction (non-positive depth window).")
+    else:
+        alpha_qzv = out_qc / "alpha-rarefaction.qzv"
+        alpha_qzv.unlink(missing_ok=True)  # avoid overwrite errors
+
+        def _alpha_rarefy(with_tree: bool) -> None:
+            cmd = [
                 "qiime", "diversity", "alpha-rarefaction",
                 "--i-table", str(table_qza),
-                "--i-phylogeny", str(rooted_tree_qza),
                 "--m-metadata-file", str(metadata_tsv),
+                "--p-min-depth", str(min_depth_observed),
                 "--p-max-depth", str(auto_max_depth),
-                "--o-visualization", str(out_qc / "alpha-rarefaction.qzv"),
-            ],
-            log_file=logs / "qc_alpha_rarefaction.log",
-            logger=logger,
-        )
+                "--p-steps", str(steps_safe),
+                "--o-visualization", str(alpha_qzv),
+            ]
+            log_path = logs / ("qc_alpha_rarefaction.log" if with_tree else "qc_alpha_rarefaction_no_tree.log")
+            if with_tree:
+                cmd[4:4] = ["--i-phylogeny", str(rooted_tree_qza)]
+            run_cmd(cmd=cmd, log_file=log_path, logger=logger)
+
+        # Prefer phylogenetic run, but fall back gracefully if it fails
+        try:
+            if rooted_tree_qza.exists():
+                _alpha_rarefy(with_tree=True)
+            else:
+                _alpha_rarefy(with_tree=False)
+        except subprocess.CalledProcessError:
+            if logger:
+                logger.warning(
+                    "Phylogenetic alpha-rarefaction failed; retrying without a tree. "
+                    "See logs/qc_alpha_rarefaction.log."
+                )
+            alpha_qzv.unlink(missing_ok=True)
+            _alpha_rarefy(with_tree=False)
 
 
 
