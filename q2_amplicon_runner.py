@@ -1709,8 +1709,6 @@ def main() -> None:
             args.cutadapt_f, args.cutadapt_r
         )
 
-
-
     paths = ensure_dirs(out_dir=args.out_dir)
     logger.info("out_dir=%s denoiser=%s", paths.root, args.denoiser)
 
