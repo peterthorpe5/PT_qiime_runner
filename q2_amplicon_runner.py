@@ -1587,7 +1587,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
                    help="For Deblur: join pairs in QIIME or use forward-only reads.")
     p.add_argument("--cutadapt_f", default=None, type=str, help="Forward primer.")
     p.add_argument("--cutadapt_r", default=None, type=str, help="Reverse primer.")
-    p.add_argument("--cutadapt_discard_untrimmed", default=True,
+    p.add_argument("--cutadapt_discard_untrimmed", default=False,
                    type=lambda x: str(x).lower() in {"1", "true", "yes"},
                    help="Discard reads lacking primer matches.")
     # DADA2 
@@ -1688,13 +1688,13 @@ def main() -> None:
     # Resolve primer settings
     used_default = False
     if args.primer_preset == "v34_overhangs" and not (args.cutadapt_f or args.cutadapt_r):
-        args.cutadapt_f = f"^{V34_FWD_OVH}"
-        args.cutadapt_r = f"^{V34_REV_OVH}"
+        args.cutadapt_f = f"{V34_FWD_OVH}"      # use f"^{V34_FWD_OVH}"   if you want to enforce matching at the start
+        args.cutadapt_r = f"{V34_REV_OVH}"
         logger.warning("Using V3–V4 primers WITH Nextera overhangs (anchored).")
     elif not (args.cutadapt_f or args.cutadapt_r):
         # auto -> default to locus-only
-        args.cutadapt_f = f"^{V34_FWD}"
-        args.cutadapt_r = f"^{V34_REV}"
+        args.cutadapt_f = f"{V34_FWD}"
+        args.cutadapt_r = f"{V34_REV}"
         used_default = True
 
     # sanity: both or neither
