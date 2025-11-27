@@ -405,16 +405,16 @@ def build_rows_mode_b(
     - No prefix or fuzzy behaviour; 'ENDO.2111' does not match 'ENDO.2111.bis'.
     - Emit all R1/R2 pairs per matched stem (multi-lane friendly if present).
     """
-    print(f"[DEBUG] build_rows_mode_b: {len(sample_ids)} sample IDs from metadata", flush=True)
-    print(f"[DEBUG] build_rows_mode_b: {len(groups)} FASTQ stems detected", flush=True)
+    # print(f"[DEBUG] build_rows_mode_b: {len(sample_ids)} sample IDs from metadata", flush=True)
+    # print(f"[DEBUG] build_rows_mode_b: {len(groups)} FASTQ stems detected", flush=True)
 
     # Quick visibility for the first few IDs
-    for sid in sample_ids[:10]:
-        hits = [s for s in groups if _id_equivalent(sid, s)]
-        if hits:
-            print(f"[DEBUG] {sid}: exact-equivalent stems={len(hits)} (e.g. {hits[:3]})", flush=True)
-        else:
-            print(f"[DEBUG] {sid}: no exact-equivalent stems", flush=True)
+    #for sid in sample_ids[:10]:
+    #    hits = [s for s in groups if _id_equivalent(sid, s)]
+    #    if hits:
+    #        print(f"[DEBUG] {sid}: exact-equivalent stems={len(hits)} (e.g. {hits[:3]})", flush=True)
+     #   else:
+     #       print(f"[DEBUG] {sid}: no exact-equivalent stems", flush=True)
 
     rows: list[tuple[str, Path, Path]] = []
     missing: list[str] = []
