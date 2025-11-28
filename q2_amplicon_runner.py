@@ -1686,16 +1686,47 @@ def main() -> None:
 
     # loads of faff here tyriing to sort which primers
     # Resolve primer settings
+
+    # ---------------- Primer selection (Option 1: soft anchoring) ---------------- #
+    # Rules:
+    #   - If the user supplies --cutadapt_f / --cutadapt_r, trust them fully.
+    #   - If primer_preset is v34 or v34_overhangs, supply *unanchored* primers.
+    #   - If primer_preset is auto and user gave no primers, fall back to unanchored V3–V4.
+    #   - No caret (^) anchoring is ever inserted automatically.
+
     used_default = False
-    if args.primer_preset == "v34_overhangs" and not (args.cutadapt_f or args.cutadapt_r):
-        args.cutadapt_f = f"{V34_FWD_OVH}"      # use f"^{V34_FWD_OVH}"   if you want to enforce matching at the start
-        args.cutadapt_r = f"{V34_REV_OVH}"
-        logger.warning("Using V3–V4 primers WITH Nextera overhangs (anchored).")
-    elif not (args.cutadapt_f or args.cutadapt_r):
-        # auto -> default to locus-only
-        args.cutadapt_f = f"{V34_FWD}"
-        args.cutadapt_r = f"{V34_REV}"
-        used_default = True
+
+    if args.cutadapt_f or args.cutadapt_r:
+        # User explicitly supplied primers → trust completely.
+        if not (args.cutadapt_f and args.cutadapt_r):
+            logger.error(
+                "Provide BOTH --cutadapt_f and --cutadapt_r, or neither."
+            )
+            sys.exit(2)
+        logger.info("Using user-supplied cutadapt primers (soft, no auto-anchoring).")
+
+    else:
+        # No user primers provided → use preset behaviour.
+        if args.primer_preset == "v34_overhangs":
+            args.cutadapt_f = V34_FWD_OVH
+            args.cutadapt_r = V34_REV_OVH
+            logger.warning(
+                "Using V3–V4 primers with Nextera overhangs (soft anchoring; no '^')."
+            )
+
+        elif args.primer_preset in {"v34", "auto"}:
+            args.cutadapt_f = V34_FWD
+            args.cutadapt_r = V34_REV
+            used_default = True
+            logger.warning(
+                "Using unanchored V3–V4 locus primers (Option 1 soft anchoring). "
+                "If reads still include overhangs, rerun with --primer_preset v34_overhangs."
+            )
+
+    logger.info("cutadapt_f=%s", args.cutadapt_f)
+    logger.info("cutadapt_r=%s", args.cutadapt_r)
+
+
 
     # sanity: both or neither
     if bool(args.cutadapt_f) ^ bool(args.cutadapt_r):
@@ -1704,7 +1735,7 @@ def main() -> None:
 
     if used_default:
         logger.warning(
-            "Using default V3–V4 locus-only primers (anchored): F=%s | R=%s. "
+            "Using default V3–V4 locus-only primers soft-matching / unanchored: F=%s | R=%s. "
             "If reads still include Nextera overhangs, rerun with --primer_preset v34_overhangs.",
             args.cutadapt_f, args.cutadapt_r
         )
