@@ -1587,9 +1587,21 @@ def build_arg_parser() -> argparse.ArgumentParser:
                    help="For Deblur: join pairs in QIIME or use forward-only reads.")
     p.add_argument("--cutadapt_f", default=None, type=str, help="Forward primer.")
     p.add_argument("--cutadapt_r", default=None, type=str, help="Reverse primer.")
-    p.add_argument("--cutadapt_discard_untrimmed", default=False,
-                   type=lambda x: str(x).lower() in {"1", "true", "yes"},
-                   help="Discard reads lacking primer matches.")
+    p.add_argument(
+        "--cutadapt_discard_untrimmed",
+        action="store_true",
+        help="Discard reads lacking primer matches."
+    )
+
+    p.add_argument(
+        "--no-cutadapt_discard_untrimmed",
+        dest="cutadapt_discard_untrimmed",
+        action="store_false",
+        help="Do not discard reads lacking primer matches."
+    )
+
+    p.set_defaults(cutadapt_discard_untrimmed=False)
+
     # DADA2 
     p.add_argument("--trim_left_f", default=0, type=int, help="DADA2 trim-left F.")
     p.add_argument("--trim_left_r", default=0, type=int, help="DADA2 trim-left R.")
@@ -1777,7 +1789,7 @@ def main() -> None:
         out_qza=demux_trimmed,
         front_f=args.cutadapt_f,
         front_r=args.cutadapt_r,
-        discard_untrimmed=bool(args.cutadapt_discard_untrimmed),
+        discard_untrimmed=args.cutadapt_discard_untrimmed,
         logs=paths.logs,
     )
 
