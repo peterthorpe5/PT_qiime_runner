@@ -1610,8 +1610,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--max_ee_f", default=2.0, type=float, help="DADA2 maxEE F.")
     p.add_argument("--max_ee_r", default=2.0, type=float, help="DADA2 maxEE R.")
 
-    p.add_argument("--asv_length_range", default="250:470", type=str,
-               help="Length window for ASVs, e.g. '250:470'. If omitted, no length filter is applied.")
+    p.add_argument("--asv_length_range", default="220:470", type=str,
+               help="Length window for ASVs, e.g. '220:470'. If omitted, no length filter is applied.")
 
     # trimming
     p.add_argument("--primer_preset",
