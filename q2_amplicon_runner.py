@@ -1615,9 +1615,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
     # trimming
     p.add_argument("--primer_preset",
-            choices=["auto","v34","v34_overhangs"],
-            default="auto",
-            help=("Primer preset. 'auto' uses any explicit --cutadapt_front_* if provided, "
+            choices=["auto","v34_locus_only","v34_overhangs"],
+            default="v34_overhangs",
+            help=("Primer preset. fallback to 'v34' (locus-only):  'auto' uses any explicit --cutadapt_front_* if provided, "
                 "else falls back to 'v34' (locus-only). Use 'v34_overhangs' when Nextera "
                 "overhangs are still present."))
 
@@ -1706,37 +1706,40 @@ def main() -> None:
     #   - If primer_preset is auto and user gave no primers, fall back to unanchored V3–V4.
     #   - No caret (^) anchoring is ever inserted automatically.
 
-    used_default = False
+    # ---------------- Primer selection (Option 1: soft anchoring) ---------------- #
+
+    # Final primer strings to pass to cutadapt
+    primer_f = None
+    primer_r = None
 
     if args.cutadapt_f or args.cutadapt_r:
-        # User explicitly supplied primers → trust completely.
+        # User explicitly supplied primers
         if not (args.cutadapt_f and args.cutadapt_r):
-            logger.error(
-                "Provide BOTH --cutadapt_f and --cutadapt_r, or neither."
-            )
+            logger.error("Provide BOTH --cutadapt_f and --cutadapt_r, or neither.")
             sys.exit(2)
-        logger.info("Using user-supplied cutadapt primers (soft, no auto-anchoring).")
-
+        primer_f = args.cutadapt_f
+        primer_r = args.cutadapt_r
+        logger.info("Using user-supplied cutadapt primers.")
     else:
-        # No user primers provided → use preset behaviour.
+        # Use presets
         if args.primer_preset == "v34_overhangs":
-            args.cutadapt_f = V34_FWD_OVH
-            args.cutadapt_r = V34_REV_OVH
-            logger.warning(
-                "Using V3–V4 primers with Nextera overhangs (soft anchoring; no '^')."
-            )
+            primer_f = V34_FWD_OVH
+            primer_r = V34_REV_OVH
+            logger.info("Using V3–V4 + Nextera overhang primers.")
+        elif args.primer_preset == "v34_locus_only":
+            primer_f = V34_FWD
+            primer_r = V34_REV
+            logger.info("Using pure V3–V4 locus primers.")
+        elif args.primer_preset == "auto":
+            primer_f = V34_FWD
+            primer_r = V34_REV
+            logger.info("Using auto: defaulting to locus-only primers.")
+        else:
+            raise ValueError(f"Unknown primer preset: {args.primer_preset}")
 
-        elif args.primer_preset in {"v34", "auto"}:
-            args.cutadapt_f = V34_FWD
-            args.cutadapt_r = V34_REV
-            used_default = True
-            logger.warning(
-                "Using unanchored V3–V4 locus primers (Option 1 soft anchoring). "
-                "If reads still include overhangs, rerun with --primer_preset v34_overhangs."
-            )
-
-    logger.info("cutadapt_f=%s", args.cutadapt_f)
-    logger.info("cutadapt_r=%s", args.cutadapt_r)
+    # Log the final primers actually used
+    logger.info("Final primers: F=%s", primer_f)
+    logger.info("Final primers: R=%s", primer_r)
 
 
 
@@ -1745,12 +1748,6 @@ def main() -> None:
         logger.error("Provide BOTH --cutadapt_f and --cutadapt_r (or use --primer_preset).")
         sys.exit(2)
 
-    if used_default:
-        logger.warning(
-            "Using default V3–V4 locus-only primers soft-matching / unanchored: F=%s | R=%s. "
-            "If reads still include Nextera overhangs, rerun with --primer_preset v34_overhangs.",
-            args.cutadapt_f, args.cutadapt_r
-        )
 
     paths = ensure_dirs(out_dir=args.out_dir)
     logger.info("out_dir=%s denoiser=%s", paths.root, args.denoiser)
@@ -1787,8 +1784,8 @@ def main() -> None:
     qiime_cutadapt_trim_paired(
         in_qza=demux_paired,
         out_qza=demux_trimmed,
-        front_f=args.cutadapt_f,
-        front_r=args.cutadapt_r,
+        front_f=primer_f,
+        front_r=primer_r,
         discard_untrimmed=args.cutadapt_discard_untrimmed,
         logs=paths.logs,
     )
