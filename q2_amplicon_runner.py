@@ -1402,22 +1402,46 @@ def ensure_qiime2_tmp(*, tmp_root: Path) -> Path:
 
 def qiime_cutadapt_trim_paired(
     *, in_qza: Path, out_qza: Path,
-    front_f: Optional[str], front_r: Optional[str],
+    front_f: Optional[list[str]], front_r: Optional[list[str]],
     discard_untrimmed: bool, logs: Path, logger: Optional[logging.Logger] = None
 ) -> None:
-    """Run q2-cutadapt trim-paired if primers are supplied; else copy artefact."""
+    """
+    Run q2-cutadapt trim-paired with support for multiple forward and reverse primers.
+
+    Parameters
+    ----------
+    in_qza : Path
+        Input demuxed reads.
+    out_qza : Path
+        Output trimmed sequences.
+    front_f : list of str or None
+        List of forward primers.
+    front_r : list of str or None
+        List of reverse primers.
+    discard_untrimmed : bool
+        Whether to discard reads without primer matches.
+    logs : Path
+        Directory for logs.
+    """
     if front_f and front_r:
         cmd = [
             "qiime", "cutadapt", "trim-paired",
             "--i-demultiplexed-sequences", str(in_qza),
-            "--p-front-f", front_f,
-            "--p-front-r", front_r,
             "--p-discard-untrimmed", str(discard_untrimmed).lower(),
             "--o-trimmed-sequences", str(out_qza),
         ]
+
+        # add repeated flags for each primer
+        for f in front_f:
+            cmd.extend(["--p-front-f", f])
+        for r in front_r:
+            cmd.extend(["--p-front-r", r])
+
         run_cmd(cmd=cmd, log_file=logs / "03_cutadapt_trim_paired.log", logger=logger)
+
     else:
         shutil.copy2(in_qza, out_qza)
+
 
 
 def filter_asvs_by_length(*, repseqs_qza: Path, table_qza: Path,
@@ -1717,29 +1741,36 @@ def main() -> None:
         if not (args.cutadapt_f and args.cutadapt_r):
             logger.error("Provide BOTH --cutadapt_f and --cutadapt_r, or neither.")
             sys.exit(2)
-        primer_f = args.cutadapt_f
-        primer_r = args.cutadapt_r
+        primer_f = [args.cutadapt_f]
+        primer_r = [args.cutadapt_r]
         logger.info("Using user-supplied cutadapt primers.")
     else:
-        # Use presets
-        if args.primer_preset == "v34_overhangs":
-            primer_f = V34_FWD_OVH
-            primer_r = V34_REV_OVH
-            logger.info("Using V3–V4 + Nextera overhang primers.")
-        elif args.primer_preset == "v34_locus_only":
-            primer_f = V34_FWD
-            primer_r = V34_REV
-            logger.info("Using pure V3–V4 locus primers.")
-        elif args.primer_preset == "auto":
-            primer_f = V34_FWD
-            primer_r = V34_REV
-            logger.info("Using auto: defaulting to locus-only primers.")
-        else:
-            raise ValueError(f"Unknown primer preset: {args.primer_preset}")
+
+        # New full adapter sets
+        ALL_FORWARD = [
+            "AGTCAGTCAGCCGGACTACHVGGGTWTCTAAT",  # 515F
+            "GTGCCAGCMGCCGCGGTAA",               # 515FC
+            "TCGTCGGCAGCGTCAGATGTGTATAAGAGACAGCCTACGGGNGGCWGCAG",  # 241F
+            "TCGTCGGCAGCGTCAGATGTGTATAAGAGACAG",                    # FWoverhang
+        ]
+
+        ALL_REVERSE = [
+            "GGACTACHVGGGTWTCTAAT",              # 806R
+            "GTCTCGTGGGCTCGGAGATGTGTATAAGAGACAGGACTACHVGGGTATCTAATCC",  # 785R
+            "GTCTCGTGGGCTCGGAGATGTGTATAAGAGACAG",                        # RVoverhang
+        ]
+
+        # override final primers
+        primer_f = ALL_FORWARD
+        primer_r = ALL_REVERSE
+        logger.info("Using multiple cutadapt primers (F=%d, R=%d).", len(primer_f), len(primer_r))
+
 
     # Log the final primers actually used
     logger.info("Final primers: F=%s", primer_f)
     logger.info("Final primers: R=%s", primer_r)
+    logger.info("Cutadapt will search %d forward and %d reverse primers.", len(primer_f), len(primer_r))
+
 
 
 

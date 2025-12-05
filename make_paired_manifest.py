@@ -166,6 +166,9 @@ def find_fastqs(
     for p in reads_dir.rglob("*"):
         if p.is_file() and any(str(p).endswith(e) for e in exts):
             paths.append(p.resolve())
+            # USE SYMLINK NAME, NOT RESOLVED TARGET
+            #paths.append(p)   # keep the symlink's filename
+
     return paths
 
 
@@ -222,39 +225,25 @@ def _stem_core(stem: str) -> str:
     return re.sub(r'([._-])S\d+$', '', stem)
 
 
-def _id_equivalent(sample_id: str, stem: str) -> bool:
-    """Test strict equivalence between a metadata sample ID and a FASTQ stem.
 
-    Rules
-    -----
-    1) Treat '_' and '.' as interchangeable (equivalence classes).
-    2) Allow *only* a trailing lane token on the stem (e.g., '_S123').
-    3) No prefix matching, no extra suffixes (so 'ENDO.2111' ≠ 'ENDO.2111.bis').
+
+def _id_equivalent(sample_id: str, stem: str) -> bool:
+    """
+    Return True when the metadata sample ID and FASTQ stem match exactly.
+
+    This simplified version is used for the JH201 dataset, where FASTQ stems
+    correspond exactly to metadata sample IDs with no lane suffices, no
+    secondary delimiters, and no multiplexed token patterns.
 
     Args:
-        sample_id: The metadata sample identifier (first column).
-        stem: The filename stem (portion before '_R1'/'_R2').
+        sample_id: The metadata sample identifier (exact string).
+        stem: The FASTQ stem extracted before the R1/R2 marker.
 
     Returns:
-        True if they are equivalent under these constraints, else False.
+        True if sample_id == stem, otherwise False.
     """
-    # Generate normalised variants for robust equality checks
-    sid_variants = {
-        sample_id,
-        sample_id.replace('.', '_'),
-        sample_id.replace('_', '.'),
-    }
-    # Stem variants: raw, lane-stripped, and each with dot/underscore folded
-    stem_variants = {
-        stem,
-        _stem_core(stem),
-    }
-    # Fold underscore/dot in the stem as well
-    _stem_us = stem.replace('.', '_')
-    _stem_dot = stem.replace('_', '.')
-    stem_variants.update({_stem_us, _stem_core(_stem_us), _stem_dot, _stem_core(_stem_dot)})
+    return sample_id == stem
 
-    return any(sid == st for sid in sid_variants for st in stem_variants)
 
 
 def infer_stem(name: str, stem_regex: re.Pattern[str]) -> Optional[str]:
