@@ -1695,6 +1695,12 @@ def main() -> None:
     log_memory_usage(logger=logger, prefix="START")
 
     args.out_dir = Path(args.out_dir).expanduser().resolve()
+    # Always wipe logs before starting
+    logs_dir = args.out_dir / "logs"
+    if logs_dir.exists():
+        shutil.rmtree(logs_dir)
+
+    logger = setup_logging(out_dir=args.out_dir, run_label=args.run_label)
     args.manifest = Path(args.manifest).expanduser().resolve()
     args.metadata_tsv = Path(args.metadata_tsv).expanduser().resolve()
 
