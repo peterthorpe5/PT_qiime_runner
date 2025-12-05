@@ -32,6 +32,7 @@ import re
 import shutil
 import subprocess
 import sys
+from datetime import datetime
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Optional
@@ -413,15 +414,26 @@ def run_cmd(*, cmd: list[str], log_file: Path, logger: Optional[logging.Logger] 
     subprocess.CalledProcessError
         If the command exits non-zero.
     """
+    from datetime import datetime
+
     log_file.parent.mkdir(parents=True, exist_ok=True)
+
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
     if logger is not None:
-        logger.info("▶ %s", " ".join(cmd))
+        logger.info("Running command (%s): %s", timestamp, " ".join(cmd))
         logger.debug("Step log: %s", log_file)
 
     with log_file.open("a", encoding="utf-8") as lf:
-        lf.write("$ " + " ".join(cmd) + "\n")
+        lf.write(f"\n===== BEGIN COMMAND @ {timestamp} =====\n")
+        lf.write("$ " + " ".join(cmd) + "\n\n")
         lf.flush()
+
         subprocess.run(cmd, stdout=lf, stderr=lf, check=True)
+
+        timestamp_end = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        lf.write(f"\n===== END COMMAND @ {timestamp_end} =====\n")
+
 
 
 def _min_sample_depth_from_biom_summary(summary_txt: Path) -> Optional[int]:
