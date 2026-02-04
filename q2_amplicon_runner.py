@@ -1664,7 +1664,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
                 help="FLASH: minimum required overlap (-m).")
     p.add_argument("--flash_max_overlap", type=int, default=300,
                 help="FLASH: maximum overlap (-M).")
-    p.add_argument("--flash_mismatch_ratio", type=float, default=0.25,
+    p.add_argument("--flash_mismatch_ratio", type=float, default=0.10,
                 help="FLASH: maximum mismatch density in overlap (-x).")
     p.add_argument(
         "--flash_binary",
