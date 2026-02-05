@@ -44,6 +44,8 @@ import logging
 import csv
 import time
 import pandas as pd
+import gzip
+import math
 from typing import Iterable, Optional, Dict
 try:
     import psutil
@@ -456,6 +458,131 @@ def log_memory_usage(
         parts.append(extra_msg)
 
     logger.info(" | ".join(parts))
+
+
+
+def _open_maybe_gzip(*, path: Path):
+    """Open a text FASTQ file that may be gzipped."""
+    if path.suffix == ".gz":
+        return gzip.open(path, mode="rt", encoding="utf-8", errors="replace")
+    return path.open(mode="r", encoding="utf-8", errors="replace")
+
+
+def _sample_fastq_read_lengths(
+    *,
+    fastq_paths: Iterable[Path],
+    max_reads: int = 20000,
+) -> list[int]:
+    """Sample read lengths from one or more FASTQ files.
+
+    Reads up to `max_reads` reads total across the provided FASTQs.
+
+    Parameters
+    ----------
+    fastq_paths : Iterable[pathlib.Path]
+        FASTQ or FASTQ.GZ files.
+    max_reads : int, default 20000
+        Maximum number of reads to sample across all files.
+
+    Returns
+    -------
+    list[int]
+        Observed read lengths.
+    """
+    lengths: list[int] = []
+    reads_seen = 0
+
+    for fp in fastq_paths:
+        if reads_seen >= max_reads:
+            break
+        if not fp.exists():
+            continue
+
+        with _open_maybe_gzip(path=fp) as handle:
+            while reads_seen < max_reads:
+                header = handle.readline()
+                if not header:
+                    break
+                seq = handle.readline()
+                plus = handle.readline()
+                qual = handle.readline()
+                if not qual:
+                    break
+                lengths.append(len(seq.strip()))
+                reads_seen += 1
+
+    return lengths
+
+
+def _percentile_int(*, values: list[int], q: float) -> int:
+    """Return an integer percentile using a simple sorted-index method."""
+    if not values:
+        raise ValueError("No values provided for percentile calculation.")
+    if q <= 0:
+        return min(values)
+    if q >= 100:
+        return max(values)
+
+    vals = sorted(values)
+    # 0-indexed rank
+    rank = int(math.floor((q / 100.0) * (len(vals) - 1)))
+    return int(vals[rank])
+
+
+def infer_deblur_trim_length(
+    *,
+    fastq_paths: Iterable[Path],
+    percentile: float = 10.0,
+    min_len: int = 150,
+    max_len: Optional[int] = None,
+    warn_below: int = 200,
+    logger: Optional[logging.Logger] = None,
+) -> int:
+    """Infer a Deblur trim length from observed read lengths.
+
+    Uses a low percentile so most reads are long enough after trimming.
+
+    Returns
+    -------
+    int
+        Recommended trim length.
+    """
+    lengths = _sample_fastq_read_lengths(fastq_paths=fastq_paths, max_reads=20000)
+    if not lengths:
+        if logger:
+            logger.warning(
+                "Deblur trim-length auto-inference failed (no reads sampled); "
+                "falling back to 200. Consider setting --deblur_trim_length explicitly."
+            )
+        return 200
+
+    p = _percentile_int(values=lengths, q=percentile)
+    rec = max(min_len, int(p))
+    if max_len is not None:
+        rec = min(rec, int(max_len))
+
+    if logger:
+        logger.info(
+            "Deblur trim-length auto-inference: sampled=%d reads; "
+            "min=%d, p%.0f=%d, median=%d, max=%d; chosen=%d",
+            len(lengths),
+            min(lengths),
+            percentile,
+            p,
+            _percentile_int(values=lengths, q=50.0),
+            max(lengths),
+            rec,
+        )
+        if rec < warn_below:
+            logger.warning(
+                "Auto-inferred Deblur trim length (%d) is low. This will force all ASVs to %d bp "
+                "and can reduce taxonomic resolution. Check your joining/trimming settings or set "
+                "--deblur_trim_length explicitly.",
+                rec,
+                rec,
+            )
+
+    return rec
 
 
 
@@ -1724,7 +1851,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
                 "overhangs are still present."))
 
     # Deblur knob
-    p.add_argument("--deblur_trim_length", default=200, type=int, help="Deblur trim length.")
+    p.add_argument("--deblur_trim_length", default=0, type=int, help="Deblur trim length.")
     # flash merge options
     p.add_argument("--flash_min_overlap", type=int, default=20,
                 help="FLASH: minimum required overlap (-m).")
@@ -2004,6 +2131,56 @@ def main() -> None:
             raise ValueError(f"Unknown pair_strategy: {args.pair_strategy}")
 
         # Deblur as before
+        # Determine Deblur trim length (explicit or auto)
+        deblur_trim = int(args.deblur_trim_length)
+
+        if deblur_trim == 0:
+            if args.pair_strategy == "join_with_flash":
+                # Infer from the actual merged reads that will be imported
+                fastqs = [fq for _, fq in joined_rows]
+                deblur_trim = infer_deblur_trim_length(
+                    fastq_paths=fastqs,
+                    percentile=10.0,
+                    min_len=150,
+                    max_len=None,
+                    warn_below=200,
+                    logger=logger,
+                )
+            elif args.pair_strategy == "forward_only":
+                # Infer from forward reads in the paired manifest
+                triples = parse_paired_manifest(manifest=args.manifest)
+                fastqs = [r1 for _, r1, _ in triples]
+                deblur_trim = infer_deblur_trim_length(
+                    fastq_paths=fastqs,
+                    percentile=10.0,
+                    min_len=150,
+                    max_len=None,
+                    warn_below=200,
+                    logger=logger,
+                )
+            else:
+                # join_in_qiime: you *can* export joined_qza and sample it, but fallback is OK
+                deblur_trim = 200
+                logger.warning(
+                    "Auto Deblur trim-length with pair_strategy=join_in_qiime is not implemented; "
+                    "using fallback %d. Set --deblur_trim_length explicitly if needed.",
+                    deblur_trim,
+                )
+
+        logger.info("Deblur trim length in use: %d", deblur_trim)
+
+        qiime_deblur_denoise_single(
+            in_qza=deblur_in,
+            table_qza=table_qza,
+            repseqs_qza=repseqs_qza,
+            trim_length=deblur_trim,
+            threads=args.threads,
+            logs=paths.logs,
+        )
+
+########
+
+
         qiime_deblur_denoise_single(
             in_qza=deblur_in,
             table_qza=table_qza,
