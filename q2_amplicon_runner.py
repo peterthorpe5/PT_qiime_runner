@@ -1707,6 +1707,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--trim_left_r", default=0, type=int, help="DADA2 trim-left R.")
     p.add_argument("--trunc_len_f", default=0, type=int, help="DADA2 trunc-len F.")
     p.add_argument("--trunc_len_r", default=0, type=int, help="DADA2 trunc-len R.")
+    # max_ee of 2.0 was too strict in our tests, leading to very few reads passing. 
+    # 5.0 is more reasonable for typical Illumina data, but users can adjust as needed.
     p.add_argument("--max_ee_f", default=5.0, type=float, help="DADA2 maxEE F.")
     p.add_argument("--max_ee_r", default=5.0, type=float, help="DADA2 maxEE R.")
 
