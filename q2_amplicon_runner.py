@@ -1724,7 +1724,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
                 "overhangs are still present."))
 
     # Deblur knob
-    p.add_argument("--deblur_trim_length", default=0, type=int, help="Deblur trim length.")
+    p.add_argument("--deblur_trim_length", default=200, type=int, help="Deblur trim length.")
     # flash merge options
     p.add_argument("--flash_min_overlap", type=int, default=20,
                 help="FLASH: minimum required overlap (-m).")
