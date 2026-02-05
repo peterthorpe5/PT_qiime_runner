@@ -2181,16 +2181,6 @@ def main() -> None:
 ########
 
 
-        qiime_deblur_denoise_single(
-            in_qza=deblur_in,
-            table_qza=table_qza,
-            repseqs_qza=repseqs_qza,
-            trim_length=args.deblur_trim_length,
-            threads=args.threads,
-            logs=paths.logs,
-        )
-
-
     if args.asv_length_range:
         try:
             Lmin, Lmax = map(int, args.asv_length_range.split(":"))
