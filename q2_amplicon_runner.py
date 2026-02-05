@@ -1707,8 +1707,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--trim_left_r", default=0, type=int, help="DADA2 trim-left R.")
     p.add_argument("--trunc_len_f", default=0, type=int, help="DADA2 trunc-len F.")
     p.add_argument("--trunc_len_r", default=0, type=int, help="DADA2 trunc-len R.")
-    p.add_argument("--max_ee_f", default=2.0, type=float, help="DADA2 maxEE F.")
-    p.add_argument("--max_ee_r", default=2.0, type=float, help="DADA2 maxEE R.")
+    p.add_argument("--max_ee_f", default=5.0, type=float, help="DADA2 maxEE F.")
+    p.add_argument("--max_ee_r", default=5.0, type=float, help="DADA2 maxEE R.")
 
     p.add_argument("--asv_length_range", default="100:970", type=str,
                help="Length window for ASVs, e.g. '100:970'. If omitted, no length filter is applied.")
