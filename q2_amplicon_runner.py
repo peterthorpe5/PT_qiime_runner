@@ -39,6 +39,7 @@ from typing import Dict, Optional
 from tempfile import NamedTemporaryFile
 import stat
 import os
+import errno
 import logging
 import csv
 import time
@@ -229,6 +230,69 @@ def validate_metadata_content(
             raise ValueError(
                 f"Column count mismatch at line {i} ({nf} vs header {n_cols}) in {metadata_tsv}"
             )
+
+
+def _rmtree_onerror(func, path, exc_info):
+    """
+    Handle errors from shutil.rmtree by making paths writable and retrying.
+
+    This is useful on shared filesystems where permissions and transient locks
+    can cause intermittent deletion failures.
+    """
+    try:
+        os.chmod(path, 0o700)
+    except OSError:
+        pass
+    try:
+        func(path)
+    except OSError:
+        # Let the caller decide whether to retry.
+        raise
+
+
+def safe_rmtree(path: Path, retries: int = 6, sleep_s: float = 0.5) -> bool:
+    """
+    Remove a directory tree robustly on shared filesystems.
+
+    Returns True if the directory is removed (or did not exist), False otherwise.
+    """
+    if not path.exists():
+        return True
+
+    for attempt in range(1, retries + 1):
+        try:
+            shutil.rmtree(path, onerror=_rmtree_onerror)
+            return True
+        except OSError as exc:
+            # Errno 39: directory not empty (common on NFS/parallel writes)
+            if exc.errno in {errno.ENOTEMPTY, errno.EBUSY, errno.EACCES}:
+                time.sleep(sleep_s * attempt)
+                continue
+            time.sleep(sleep_s * attempt)
+
+    return False
+
+
+def safe_rotate_then_rmtree(path: Path) -> Optional[Path]:
+    """
+    Rename a directory to a unique name, then attempt deletion.
+
+    Renaming first reduces races where other processes are still writing into
+    the original directory name.
+    """
+    if not path.exists():
+        return None
+
+    rotated = path.with_name(f"{path.name}.old.{int(time.time())}")
+    try:
+        path.rename(rotated)
+    except OSError:
+        # If rename fails, fall back to deleting in place
+        rotated = path
+
+    _ = safe_rmtree(rotated)
+    return rotated
+
 
 
 def make_qiime_metadata_copy(
@@ -1697,8 +1761,15 @@ def main() -> None:
     args.out_dir = Path(args.out_dir).expanduser().resolve()
     # Always wipe logs before starting
     logs_dir = args.out_dir / "logs"
-    if logs_dir.exists():
-        shutil.rmtree(logs_dir)
+
+    # Instead of shutil.rmtree(logs_dir) - this fails on our filesystem when files are 
+    # in use (e.g. if the user tries to re-run without closing previous logs). 
+    # Instead, we try to rename it out of the way first, then remove the old one asynchronously. 
+    # This way we avoid blocking on file locks and ensure a clean logs directory for the new run.
+    rotated = safe_rotate_then_rmtree(Path(logs_dir))
+    if rotated is not None and Path(rotated).exists():
+        logger.warning("Could not fully remove logs directory: %s", rotated)
+
 
     logger = setup_logging(out_dir=args.out_dir, run_label=args.run_label)
     args.manifest = Path(args.manifest).expanduser().resolve()
