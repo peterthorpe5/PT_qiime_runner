@@ -35,8 +35,6 @@ python q2_postanalysis_runner.py \
   --run_ancom \
   --export_visuals \
   --threads 24
-
-  
 """
 
 from __future__ import annotations
@@ -1617,6 +1615,34 @@ def main() -> None:
     exports.mkdir(parents=True, exist_ok=True)
 
     if taxonomy_present and taxonomy:
+        # 4a) One taxa barplot using the rarefied table (IDs match taxonomy.qza)
+        taxa_qzv = viz / "taxa-barplot.qzv"
+        run(
+            [
+                "qiime", "taxa", "barplot",
+                "--i-table", str(rarefied),
+                "--i-taxonomy", str(taxonomy),
+                "--m-metadata-file", str(metadata),
+                "--o-visualization", str(taxa_qzv),
+            ],
+            log, logs / "taxa_barplot.log",
+        )
+
+        taxa_export_dir = exports / "taxa-barplot"
+        run(
+            [
+                "qiime", "tools", "export",
+                "--input-path", str(taxa_qzv),
+                "--output-path", str(taxa_export_dir),
+            ],
+            log, logs / "export_taxa_barplot.log",
+        )
+
+        if args.pdf_engine != "none":
+            try_html_to_pdf(taxa_export_dir, log, args.pdf_engine)
+
+        # 4b) Still create collapsed tables per level (useful for summaries/exports),
+        # but do NOT run qiime taxa barplot on them.
         for level in args.tax_levels:
             collapsed = art / f"table_L{level}.qza"
             run(
@@ -1630,35 +1656,11 @@ def main() -> None:
                 log, logs / f"taxa_collapse_L{level}.log",
             )
 
-            taxa_qzv = viz / f"taxa-barplot_L{level}.qzv"
-            run(
-                [
-                    "qiime", "taxa", "barplot",
-                    "--i-table", str(collapsed),
-                    "--i-taxonomy", str(taxonomy),
-                    "--m-metadata-file", str(metadata),
-                    "--o-visualization", str(taxa_qzv),
-                ],
-                log, logs / f"taxa_barplot_L{level}.log",
-            )
-
-            taxa_export_dir = exports / f"taxa-barplot_L{level}"
-            run(
-                [
-                    "qiime", "tools", "export",
-                    "--input-path", str(taxa_qzv),
-                    "--output-path", str(taxa_export_dir),
-                ],
-                log, logs / f"export_taxa_barplot_L{level}.log",
-            )
-
-            if args.pdf_engine != "none":
-                try_html_to_pdf(taxa_export_dir, log, args.pdf_engine)
-
         write_taxa_summary_tsv(out_dir=out, art_dir=art, tax_levels=args.tax_levels, log=log)
 
     else:
-        log.info("taxonomy.qza not found; skipping taxonomy barplots.")
+        log.info("taxonomy.qza not found; skipping taxonomy outputs.")
+
 
 
     # 5) ANCOM (optional; requires group column)
